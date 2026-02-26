@@ -18,9 +18,10 @@ This project implements a creative director agent named "SceneOne_Director" that
     ```
 
 2.  **Run the agent**:
-    (Instructions on how to run the agent would go here. This part is not yet clear from the provided files.)
-    ### Execute the ADK WEB from the command line.
+    Execute the ADK WEB from the command line.
+    ```bash
     adk web .
+    ```
 
 ## Example Output
 
