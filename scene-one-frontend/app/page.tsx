@@ -1,65 +1,128 @@
-import Image from "next/image";
+"use client"
+import { CopilotSidebar, CopilotChat } from "@copilotkit/react-ui";
+import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
+import { useEffect, useState, useRef } from "react";
 
-export default function Home() {
+export default function Page() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null); // Store the stream here
+  const [ lastDownloadUrl, setLastDownLoadUrl ] = useState<string | null>(null);
+  const [downloadLink, setDownloadLink] = useState<string | null>(null);
+  const [ isCameraActive, setIsCameraActive ] = useState(false);
+
+// START CAMERA
+  async function startProduction() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        setIsCameraActive(true);
+      }
+    } catch (err) {
+      console.error("Failed to start production", err);
+    }
+  }  
+
+// STOP CAMERA (The Kill Switch)
+  function stopProduction() {
+    if (streamRef.current) {
+      // 1. Stop all audio and video tracks
+      streamRef.current.getTracks().forEach(track => track.stop());
+      
+      // 2. Clear the video element
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+      
+      streamRef.current = null;
+      setIsCameraActive(false);
+    }
+  }  
+
+  // PIPE to Agent
+  // This makes the 'live state of SceneOne Studio readeable to the Director'
+  useCopilotReadable({
+    description: "The current visual state of the production studio",
+    value: isCameraActive ? "Camera is LIVE. Viewing product silhouette" : "Camera is OFF"
+  })
+
+useCopilotAction({
+  name: "capture_ad_script",
+  description: "Alerts the UI that a script and audio recording are ready.",
+  parameters: [
+    { name: "product_name", type: "string" },
+    { name: "final_script", type: "string" }
+  ],
+  handler: async ({ product_name }) => {
+    // We assume the filename follows our backend pattern
+    const filename = `sceneone_script_${(product_name ?? "").replace(/\s+/g, "_").toLowerCase()}.txt`;
+    setDownloadLink(`http://localhost:8000/download/${filename}`);
+    alert(`🎬 SceneOne: ${product_name} Ad is in the can!`);
+  },
+});
+
+// Cleanup on unmount (If the user closes the tab)
+  useEffect(() => {
+    return () => stopProduction();
+  }, []);
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="flex flex-col items-center p-8">
+      <div className="flex gap-4 mb-6">
+        {!isCameraActive ? (
+          <button onClick={startProduction} className="px-6 py-2 bg-green-600 text-white rounded-lg font-bold">
+            Start Live Session
+          </button>
+        ) : (
+          <button onClick={stopProduction} className="px-6 py-2 bg-red-600 text-white rounded-lg font-bold">
+            End Live Session
+          </button>
+        )}
+      </div>
+
+
+      <h1 className="text-4xl font-bold mb-4">SceneOne Production Studio</h1>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full max-w-6xl">
+
+        {/* LEFT SIDE: The camera & Preview */}
+        <div className="relative group">
+          <div className="absolute -top-3 -left-3 bg-red-600 text-white px-3 py-1 rounded-full text-xs font-bold animate-pulse z-10s">
+              LIVE FEED
+          </div>
+          <video 
+            ref={videoRef}
+            autoPlay
+            muted
+            className="w-full rounded-2xl shadow-2xl border-4 border-white bg-black aspect-video object-cover"
+          />
+          <div className="mt-4 flex gap-2">
+             <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-md text-sm font-medium">1080p Stream</span>
+             <span className="px-3 py-1 bg-green-100 text-green-700 rounded-md text-sm font-medium">Gemini 2.5 Vision Active</span>
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        {/* RIGHT SIDE: The Directors Console */}
+        <div className="h-150 border rounded-xl overflow-hidden shadow-lg">
+          <CopilotChat 
+            instructions={"You are the SceneOneDirector. Analyse the video feed to help the user create an ad."}
+            labels={{
+              title: "Directors Console",
+              placeholder: "Show a product and say 'Action'..."
+            }}
+          />
         </div>
-      </main>
-    </div>
-  );
+      </div>
+
+      {/* DOWNLOAD SECTION */}
+      {lastDownloadUrl && (
+        <div className="mt-8 p-4 bg-green-100 border border-green-500 rounded-lg">
+          <p className="text-green-800 font-bold">🎬 Ad Production Complete!</p>
+          <a href={lastDownloadUrl} download className="underline">Download .WAV Export</a>
+        </div>
+      )}
+
+        
+    </main>
+  )
 }

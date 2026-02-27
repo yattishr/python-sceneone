@@ -9,12 +9,19 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@copilotkit/react-core": "^1.51.4",
-    "@copilotkit/react-ui": "^1.51.4",
-    "@copilotkit/runtime": "^1.51.4",
+    "@ag-ui/client": "0.0.45",
+    "@copilotkit/react-core": "^1.52.0",
+    "@copilotkit/react-ui": "^1.52.0",
+    "@copilotkit/runtime": "^1.52.0",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3"
+  },
+  "overrides": {
+    "@ag-ui/client": "0.0.45",
+    "@ag-ui/core": "0.0.45",
+    "@ag-ui/encoder": "0.0.45",
+    "@ag-ui/proto": "0.0.45"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
