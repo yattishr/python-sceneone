@@ -4,20 +4,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
+
+from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint
+from scene_one_agent.agent import root_agent
+
 import shutil
+import uvicorn
 
-app = FastAPI(title="SceneOne Production Hub")
-
-# Enable CORS so React frontend can communicate
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+adk_agent = ADKAgent(
+    adk_agent=root_agent,          # Use 'adk_agent' instead of 'agent'
+    app_name="SceneOne_Studio",    # Must match your frontend config later
+    user_id="studio_user_01",      # For session tracking
+    session_timeout_seconds=3600,
+    use_in_memory_services=True
 )
 
+app = FastAPI(title="SceneOne AG-UI Backend")
+add_adk_fastapi_endpoint(app, adk_agent, path="/copilotkit")
+
 # Create a directory for exported audio files
-EXPORT_DIR = "exports/audio",
+EXPORT_DIR = "exports/audio"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 def trim_and_clean_audio(file_path):
@@ -30,15 +36,24 @@ def trim_and_clean_audio(file_path):
     # Normalize: Brings the peaks to a consistent level
     audio = audio.normalize()
 
-    # Trim leading silence
-    start_trim = detect_leading_silence(audio, silence_threshold=-40)
+    # Detect leading silence
+    # detect_leading_silence returns a list of (start_ms, end_ms) tuples
+    # We want the end_ms of the first silence segment to know where the actual audio starts
+    leading_silence_segments = detect_leading_silence(audio, silence_thresh=-40, min_silence_len=500)
+    start_trim_ms = leading_silence_segments[0][1] if leading_silence_segments else 0
 
-    # Trim trailing silence
-    end_trim = detect_leading_silence(audio.reverse(), silence_threshold=-40)
+    # Detect trailing silence by reversing the audio and detecting leading silence
+    trailing_silence_segments = detect_leading_silence(audio.reverse())
+    end_trim_ms = trailing_silence_segments[0][1] if trailing_silence_segments else 0
 
     duration = len(audio)
-    # Slice the audio adding 100ms padding
-    trimmed_audio = audio[max(start_trim-100, 0) : (duration - end_trim + 100)]
+
+    # Apply padding: subtract 100ms from start_trim_ms (but not less than 0)
+    # and add 100ms to the end of the audio (effectively reducing the amount trimmed from the end)
+    start_index = max(0, start_trim_ms - 100)
+    end_index = min(duration, duration - end_trim_ms + 100)
+
+    trimmed_audio = audio[start_index : end_index]
 
     # 50ms fades to prevent digital 'clicks'
     final_audio = trimmed_audio.fade_in(50).fade_out(50)
@@ -49,7 +64,7 @@ def trim_and_clean_audio(file_path):
 # Mount the folder so files ace accessible via http://localhost:8000/download/ad.wav
 app.mount("/download", StaticFiles(directory=EXPORT_DIR), name="download")
 
-app.post("/upload-ad")
+@app.post("/upload-ad")
 async def upload_ad(file: UploadFile = File(...)):
     temp_path = f"temp_{file.filename}"
     
