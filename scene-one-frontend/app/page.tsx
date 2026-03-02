@@ -1,7 +1,8 @@
 "use client"
 import { CopilotChat } from "@copilotkit/react-ui";
-import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
+import { useCopilotAction, useCopilotChat, useCopilotReadable } from "@copilotkit/react-core";
 import { useEffect, useState, useRef } from "react";
+import { ImageMessage, MessageRole, TextMessage } from "@copilotkit/runtime-client-gql";
 
 type AssetCard = {
   productName: string;
@@ -10,27 +11,199 @@ type AssetCard = {
   wavUrl: string;
 };
 
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: any) => void) | null;
+  onerror: ((event: any) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionFactory = new () => BrowserSpeechRecognition;
+
+const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const RECORDING_DURATION_MS = 10_000;
+const SPEECH_SEND_COOLDOWN_MS = 1200;
+
+function pickRecorderMimeType(): string | undefined {
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+function extensionFromMimeType(mimeType: string): string {
+  if (mimeType.includes("ogg")) return "ogg";
+  if (mimeType.includes("mp4")) return "m4a";
+  return "webm";
+}
+
 export default function Page() {
+  const { appendMessage, isLoading } = useCopilotChat();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const isSessionActiveRef = useRef(false);
+  const lastSpeechSendAtRef = useRef(0);
+
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [visionLogs, setVisionLogs] = useState<string[]>(["[SYSTEM]: Awaiting live camera signal"]);
   const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
+  const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
+
+  const getSpeechRecognitionFactory = (): SpeechRecognitionFactory | null => {
+    if (typeof window === "undefined") return null;
+    const candidate = (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition;
+    return candidate ?? null;
+  };
+
+  const captureCurrentVideoFrame = (): string | null => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      return null;
+    }
+
+    const canvas = document.createElement("canvas");
+    const maxWidth = 640;
+    const scale = Math.min(1, maxWidth / video.videoWidth);
+    canvas.width = Math.max(1, Math.floor(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.floor(video.videoHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return null;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/png");
+    return dataUrl.split(",")[1] ?? null;
+  };
+
+  const sendFrameToDirector = async () => {
+    const imageBytes = captureCurrentVideoFrame();
+    if (!imageBytes) {
+      return;
+    }
+
+    await appendMessage(
+      new ImageMessage({
+        role: MessageRole.User,
+        format: "png",
+        bytes: imageBytes,
+      }),
+    );
+  };
+
+  const sendDirectorMessage = async (content: string) => {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    await appendMessage(
+      new TextMessage({
+        role: MessageRole.User,
+        content: trimmed,
+      }),
+    );
+  };
+
+  const stopSpeechRecognition = () => {
+    if (speechRecognitionRef.current) {
+      speechRecognitionRef.current.onend = null;
+      speechRecognitionRef.current.stop();
+      speechRecognitionRef.current = null;
+    }
+    setSpeechStatus("idle");
+  };
+
+  const startSpeechRecognition = () => {
+    const SpeechRecognitionCtor = getSpeechRecognitionFactory();
+    if (!SpeechRecognitionCtor) {
+      setSpeechStatus("unsupported");
+      setVisionLogs((prev) => ["[WARN]: Browser speech recognition unavailable", ...prev].slice(0, 6));
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+
+    recognition.onresult = async (event) => {
+      const now = Date.now();
+      if (now - lastSpeechSendAtRef.current < SPEECH_SEND_COOLDOWN_MS) {
+        return;
+      }
+
+      const finalTranscript = Array.from(event.results ?? [])
+        .slice(event.resultIndex ?? 0)
+        .filter((result: any) => Boolean(result?.isFinal))
+        .map((result: any) => result[0]?.transcript ?? "")
+        .join(" ")
+        .trim();
+
+      if (!finalTranscript) {
+        return;
+      }
+
+      lastSpeechSendAtRef.current = now;
+      setVisionLogs((prev) => [`[VOICE]: ${finalTranscript}`, ...prev].slice(0, 6));
+
+      try {
+        await sendFrameToDirector();
+        await sendDirectorMessage(
+          `Live session note: camera is active. User said: "${finalTranscript}"`,
+        );
+      } catch (error) {
+        console.error("Failed to send transcript to director", error);
+        setVisionLogs((prev) => ["[ERROR]: Could not send speech to director", ...prev].slice(0, 6));
+      }
+    };
+
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error", event);
+      setVisionLogs((prev) => ["[ERROR]: Speech recognition failed", ...prev].slice(0, 6));
+    };
+
+    recognition.onend = () => {
+      if (isSessionActiveRef.current) {
+        recognition.start();
+      }
+    };
+
+    recognition.start();
+    speechRecognitionRef.current = recognition;
+    setSpeechStatus("active");
+  };
 
   async function startProduction() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       streamRef.current = stream;
+      isSessionActiveRef.current = true;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         setIsCameraActive(true);
         setVisionLogs((prev) => [
           "[SYSTEM]: Camera channel linked",
+          "[SYSTEM]: Voice command channel ready",
           "[SYSTEM]: Vision agent warmup complete",
           ...prev
         ].slice(0, 6));
       }
+
+      startSpeechRecognition();
+      await sendFrameToDirector();
+      await sendDirectorMessage(
+        "Live session started. I am showing a product on camera. React as director in real time and ask clarifying questions if needed.",
+      );
     } catch (err) {
       console.error("Failed to start production", err);
       setVisionLogs((prev) => ["[ERROR]: Camera permission denied or unavailable", ...prev].slice(0, 6));
@@ -38,6 +211,9 @@ export default function Page() {
   }
 
   function stopProduction() {
+    isSessionActiveRef.current = false;
+    stopSpeechRecognition();
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
 
@@ -54,7 +230,9 @@ export default function Page() {
 
   useCopilotReadable({
     description: "The current visual state of the production studio",
-    value: isCameraActive ? "Camera is LIVE. Viewing product silhouette" : "Camera is OFF"
+    value: isCameraActive
+      ? `Camera is LIVE. Speech channel is ${speechStatus}. ${isLoading ? "Director is responding." : "Director is idle."}`
+      : "Camera is OFF"
   });
 
   //useCoPilotAction: Alerts the UI that a script and audio recording are ready.
@@ -68,54 +246,72 @@ export default function Page() {
     handler: async ({ product_name, final_script }) => {
       setVisionLogs((prev) => ["🎬 [ACTION]: Recording 10s audio clip...", ...prev].slice(0, 6));
 
-      // 1. SETUP RECORDING
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      const audioChunks: Blob[] = [];
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = pickRecorderMimeType();
+        const mediaRecorder = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+        const audioChunks: Blob[] = [];
 
-      mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
 
-      // 2. DEFINE WHAT HAPPENS WHEN RECORDING STOPS
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-        const safeName = (product_name ?? "untitled").replace(/\s+/g, "_").toLowerCase();
-        
-        // Prepare the payload for server.py
-        const formData = new FormData();
-        formData.append("file", audioBlob, `${safeName}.wav`);
+        mediaRecorder.onstop = async () => {
+          const recorderMimeType = mediaRecorder.mimeType || mimeType || "audio/webm";
+          const extension = extensionFromMimeType(recorderMimeType);
+          const audioBlob = new Blob(audioChunks, { type: recorderMimeType });
+          const safeName = (product_name ?? "untitled").replace(/\s+/g, "_").toLowerCase();
 
-        try {
-          // 3. SHIP TO FASTAPI to upload the audio file
-          const response = await fetch("http://localhost:8000/upload-ad", {
-            method: "POST",
-            body: formData,
-          });
-          const data = await response.json();
+          const formData = new FormData();
+          formData.append("file", audioBlob, `${safeName}.${extension}`);
 
-          // 4. UPDATE UI WITH REAL DOWNLOAD URL
-          const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-          setAssetCards((prev) => [
-            {
-              productName: product_name ?? "Untitled Product",
-              finalScript: final_script ?? "No script text.",
-              timestamp: time,
-              wavUrl: data.download_url // This comes back from your server's 'exports/audio'
-            },
-            ...prev
-          ]);
-          setVisionLogs((prev) => [`[SUCCESS]: ${product_name} ad finalized`, ...prev].slice(0, 6));
-        } catch (error) {
-          console.error("Upload failed", error);
-          setVisionLogs((prev) => ["[ERROR]: Production Hub upload failed", ...prev].slice(0, 6));
-        }
-      };
+          try {
+            const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
+              method: "POST",
+              body: formData,
+            });
+            if (!response.ok) {
+              throw new Error(`Upload failed with status ${response.status}`);
+            }
 
-      // 4. START THE 10-SECOND SESSION
-      mediaRecorder.start();
-      setTimeout(() => {
-        mediaRecorder.stop();
-        stream.getTracks().forEach(t => t.stop()); // Turn off mic
-      }, 10000);
+            const data = await response.json();
+            if (!data.download_url) {
+              throw new Error("Upload succeeded but no download URL returned.");
+            }
+
+            const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+            setAssetCards((prev) => [
+              {
+                productName: product_name ?? "Untitled Product",
+                finalScript: final_script ?? "No script text.",
+                timestamp: time,
+                wavUrl: data.download_url
+              },
+              ...prev
+            ]);
+            setVisionLogs((prev) => [`[SUCCESS]: ${product_name} ad finalized`, ...prev].slice(0, 6));
+          } catch (error) {
+            console.error("Upload failed", error);
+            setVisionLogs((prev) => ["[ERROR]: Production Hub upload failed", ...prev].slice(0, 6));
+          } finally {
+            stream.getTracks().forEach((t) => t.stop());
+          }
+        };
+
+        mediaRecorder.start();
+        setTimeout(() => {
+          if (mediaRecorder.state !== "inactive") {
+            mediaRecorder.stop();
+          }
+        }, RECORDING_DURATION_MS);
+      } catch (error) {
+        console.error("Recording setup failed", error);
+        setVisionLogs((prev) => ["[ERROR]: Microphone permission denied or unavailable", ...prev].slice(0, 6));
+      }
     }
   });
 

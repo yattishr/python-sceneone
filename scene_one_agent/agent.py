@@ -6,7 +6,9 @@ from google.adk.tools import google_search
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "SceneOne")
 os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+# Use a stable generateContent-capable default for ADK chat flows.
+# Override via GEMINI_MODEL in .env if needed.
+LIVE_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # --- 1. DEFINE THE DYNAMIC VIBES ---
 VIBES = {
