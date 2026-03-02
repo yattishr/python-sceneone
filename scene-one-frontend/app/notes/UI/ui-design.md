@@ -39,16 +39,3 @@ The "Output" tray for production results.
 * **Card Contents:** * Product Name & Timestamp.
     * `Download .WAV` Primary Button.
     * `Copy Script` Secondary Button.
-
----
-
-## 3. Component Architecture (React + Tailwind)
-
-### **A. The Pulse Indicator**
-```tsx
-const RecordIndicator = () => (
-  <div className="flex items-center gap-2 px-3 py-1 bg-black/60 backdrop-blur-md rounded-full border border-red-500/40">
-    <div className="w-2 h-2 bg-red-600 rounded-full animate-pulse" />
-    <span className="text-[10px] font-mono text-red-500 uppercase tracking-widest">Live Production</span>
-  </div>
-);

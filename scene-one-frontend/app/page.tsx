@@ -1,16 +1,23 @@
 "use client"
-import { CopilotSidebar, CopilotChat } from "@copilotkit/react-ui";
+import { CopilotChat } from "@copilotkit/react-ui";
 import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
 import { useEffect, useState, useRef } from "react";
 
+type AssetCard = {
+  productName: string;
+  finalScript: string;
+  timestamp: string;
+  wavUrl: string;
+};
+
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null); // Store the stream here
-  const [ lastDownloadUrl, setLastDownLoadUrl ] = useState<string | null>(null);
-  const [downloadLink, setDownloadLink] = useState<string | null>(null);
-  const [ isCameraActive, setIsCameraActive ] = useState(false);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [visionLogs, setVisionLogs] = useState<string[]>(["[SYSTEM]: Awaiting live camera signal"]);
+  const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
 
-// START CAMERA
   async function startProduction() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -18,111 +25,197 @@ export default function Page() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         setIsCameraActive(true);
+        setVisionLogs((prev) => [
+          "[SYSTEM]: Camera channel linked",
+          "[SYSTEM]: Vision agent warmup complete",
+          ...prev
+        ].slice(0, 6));
       }
     } catch (err) {
       console.error("Failed to start production", err);
+      setVisionLogs((prev) => ["[ERROR]: Camera permission denied or unavailable", ...prev].slice(0, 6));
     }
-  }  
+  }
 
-// STOP CAMERA (The Kill Switch)
   function stopProduction() {
     if (streamRef.current) {
-      // 1. Stop all audio and video tracks
-      streamRef.current.getTracks().forEach(track => track.stop());
-      
-      // 2. Clear the video element
+      streamRef.current.getTracks().forEach((track) => track.stop());
+
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
-      
+
       streamRef.current = null;
       setIsCameraActive(false);
+      setElapsedSeconds(0);
+      setVisionLogs((prev) => ["[SYSTEM]: Camera feed closed", ...prev].slice(0, 6));
     }
-  }  
+  }
 
-  // PIPE to Agent
-  // This makes the 'live state of SceneOne Studio readeable to the Director'
   useCopilotReadable({
     description: "The current visual state of the production studio",
     value: isCameraActive ? "Camera is LIVE. Viewing product silhouette" : "Camera is OFF"
-  })
+  });
 
-useCopilotAction({
-  name: "capture_ad_script",
-  description: "Alerts the UI that a script and audio recording are ready.",
-  parameters: [
-    { name: "product_name", type: "string" },
-    { name: "final_script", type: "string" }
-  ],
-  handler: async ({ product_name }) => {
-    // We assume the filename follows our backend pattern
-    const filename = `sceneone_script_${(product_name ?? "").replace(/\s+/g, "_").toLowerCase()}.txt`;
-    setDownloadLink(`http://localhost:8000/download/${filename}`);
-    alert(`🎬 SceneOne: ${product_name} Ad is in the can!`);
-  },
-});
+  //useCoPilotAction: Alerts the UI that a script and audio recording are ready.
+  useCopilotAction({
+    name: "capture_ad_script",
+    description: "Alerts the UI that a script is ready and triggers a 10-second audio capture.",
+    parameters: [
+      { name: "product_name", type: "string" },
+      { name: "final_script", type: "string" }
+    ],
+    handler: async ({ product_name, final_script }) => {
+      setVisionLogs((prev) => ["🎬 [ACTION]: Recording 10s audio clip...", ...prev].slice(0, 6));
 
-// Cleanup on unmount (If the user closes the tab)
+      // 1. SETUP RECORDING
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      const audioChunks: Blob[] = [];
+
+      mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
+
+      // 2. DEFINE WHAT HAPPENS WHEN RECORDING STOPS
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+        const safeName = (product_name ?? "untitled").replace(/\s+/g, "_").toLowerCase();
+        
+        // Prepare the payload for server.py
+        const formData = new FormData();
+        formData.append("file", audioBlob, `${safeName}.wav`);
+
+        try {
+          // 3. SHIP TO FASTAPI to upload the audio file
+          const response = await fetch("http://localhost:8000/upload-ad", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+
+          // 4. UPDATE UI WITH REAL DOWNLOAD URL
+          const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+          setAssetCards((prev) => [
+            {
+              productName: product_name ?? "Untitled Product",
+              finalScript: final_script ?? "No script text.",
+              timestamp: time,
+              wavUrl: data.download_url // This comes back from your server's 'exports/audio'
+            },
+            ...prev
+          ]);
+          setVisionLogs((prev) => [`[SUCCESS]: ${product_name} ad finalized`, ...prev].slice(0, 6));
+        } catch (error) {
+          console.error("Upload failed", error);
+          setVisionLogs((prev) => ["[ERROR]: Production Hub upload failed", ...prev].slice(0, 6));
+        }
+      };
+
+      // 4. START THE 10-SECOND SESSION
+      mediaRecorder.start();
+      setTimeout(() => {
+        mediaRecorder.stop();
+        stream.getTracks().forEach(t => t.stop()); // Turn off mic
+      }, 10000);
+    }
+  });
+
+  useEffect(() => {
+    if (!isCameraActive) {
+      return;
+    }
+
+    const timer = setInterval(() => setElapsedSeconds((prev) => prev + 1), 1000);
+    return () => clearInterval(timer);
+  }, [isCameraActive]);
+
   useEffect(() => {
     return () => stopProduction();
   }, []);
 
+  const timerText = new Date(elapsedSeconds * 1000).toISOString().substring(11, 19);
+  const personaMode = "HYPE-LINK";
+
   return (
-    <main className="flex flex-col items-center p-8">
-      <div className="flex gap-4 mb-6">
-        {!isCameraActive ? (
-          <button onClick={startProduction} className="px-6 py-2 bg-green-600 text-white rounded-lg font-bold">
-            Start Live Session
-          </button>
-        ) : (
-          <button onClick={stopProduction} className="px-6 py-2 bg-red-600 text-white rounded-lg font-bold">
-            End Live Session
-          </button>
-        )}
-      </div>
+    <main className="studio-shell min-h-screen px-4 py-6 md:px-8 md:py-8">
+      <div className="mx-auto flex w-full max-w-350 flex-col gap-6">
+        <header className="studio-sticky-header flex flex-col items-start gap-3">
+          {!isCameraActive ? (
+            <button onClick={startProduction} className="studio-btn studio-btn-start">
+              Start Live Session
+            </button>
+          ) : (
+            <button onClick={stopProduction} className="studio-btn studio-btn-stop">
+              End Live Session
+            </button>
+          )}
+          <h1 className="studio-title text-3xl md:text-4xl">SceneOne Studio</h1>
+        </header>
 
+        <section className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+          <article className="obsidian-panel relative overflow-hidden rounded-3xl lg:col-span-7">
+            <video ref={videoRef} autoPlay muted className="aspect-video w-full rounded-3xl bg-black object-cover" />
+            <div className="hud-overlay">
+              <div className="hud-top-row">
+                <div className="hud-chip hud-rec">
+                  <span className={`hud-dot ${isCameraActive ? "animate-pulse" : ""}`} />
+                  REC {timerText}
+                </div>
+                <div className="hud-chip hud-persona">MODE: {personaMode}</div>
+              </div>
+              <div className={`scan-line ${isCameraActive ? "scan-line-active" : ""}`} />
+              <div className="hud-logs">
+                {visionLogs.map((log) => (
+                  <p key={log} className="log-line">
+                    {log}
+                  </p>
+                ))}
+              </div>
+            </div>
+          </article>
 
-      <h1 className="text-4xl font-bold mb-4">SceneOne Production Studio</h1>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full max-w-6xl">
+          <aside className="obsidian-panel director-panel rounded-3xl lg:col-span-5">
+            <CopilotChat
+              instructions={"You are the SceneOneDirector. Analyse the video feed to help the user create an ad."}
+              labels={{
+                title: "Director's Monitor",
+                placeholder: "Wait, do you like the lighting?"
+              }}
+            />
+          </aside>
+        </section>
 
-        {/* LEFT SIDE: The camera & Preview */}
-        <div className="relative group">
-          <div className="absolute -top-3 -left-3 bg-red-600 text-white px-3 py-1 rounded-full text-xs font-bold animate-pulse z-10s">
-              LIVE FEED
+        <section className="obsidian-panel rounded-3xl p-4 md:p-5">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="dock-title text-lg md:text-xl">Asset Dock</h2>
+            <p className="dock-subtitle">Recent outputs from this session</p>
           </div>
-          <video 
-            ref={videoRef}
-            autoPlay
-            muted
-            className="w-full rounded-2xl shadow-2xl border-4 border-white bg-black aspect-video object-cover"
-          />
-          <div className="mt-4 flex gap-2">
-             <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-md text-sm font-medium">1080p Stream</span>
-             <span className="px-3 py-1 bg-green-100 text-green-700 rounded-md text-sm font-medium">Gemini 2.5 Vision Active</span>
+          <div className="asset-scroll">
+            {assetCards.length === 0 ? (
+              <div className="asset-card asset-card-empty">
+                <p>Assets appear here after the director captures a script.</p>
+              </div>
+            ) : (
+              assetCards.map((asset) => (
+                <div key={`${asset.productName}-${asset.timestamp}`} className="asset-card">
+                  <p className="asset-name">{asset.productName}</p>
+                  <p className="asset-time">{asset.timestamp}</p>
+                  <div className="mt-4 flex gap-2">
+                    <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>
+                      Download .WAV
+                    </a>
+                    <button
+                      className="studio-btn studio-btn-secondary"
+                      onClick={async () => navigator.clipboard.writeText(asset.finalScript)}
+                    >
+                      Copy Script
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
           </div>
-        </div>
-
-        {/* RIGHT SIDE: The Directors Console */}
-        <div className="h-150 border rounded-xl overflow-hidden shadow-lg">
-          <CopilotChat 
-            instructions={"You are the SceneOneDirector. Analyse the video feed to help the user create an ad."}
-            labels={{
-              title: "Directors Console",
-              placeholder: "Show a product and say 'Action'..."
-            }}
-          />
-        </div>
+        </section>
       </div>
-
-      {/* DOWNLOAD SECTION */}
-      {lastDownloadUrl && (
-        <div className="mt-8 p-4 bg-green-100 border border-green-500 rounded-lg">
-          <p className="text-green-800 font-bold">🎬 Ad Production Complete!</p>
-          <a href={lastDownloadUrl} download className="underline">Download .WAV Export</a>
-        </div>
-      )}
-
-        
     </main>
-  )
+  );
 }
