@@ -2,19 +2,29 @@ import os
 import re
 import shutil
 import uuid
+import asyncio
+import traceback
 from pathlib import Path
+from contextlib import aclosing
+from typing import Literal
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.websockets import WebSocketDisconnect
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint
 from scene_one_agent.agent import root_agent
 
 import uvicorn
+from google.adk import Runner
+from google.adk.agents import RunConfig
+from google.adk.agents.live_request_queue import LiveRequestQueue, LiveRequest
+from google.genai import types
 
 # Align env-loading behavior with `adk web .` so direct `server.py` runs
 # can resolve Gemini credentials from the project .env file.
@@ -45,6 +55,17 @@ adk_agent = ADKAgent(
 app = FastAPI(title="SceneOne AG-UI Backend")
 ADK_ENDPOINT_PATH = "/copilotkit"
 add_adk_fastapi_endpoint(app, adk_agent, path=ADK_ENDPOINT_PATH)
+
+LIVE_APP_NAME = os.getenv("ADK_LIVE_APP_NAME", "scene_one_agent")
+live_runner = Runner(
+    app_name=LIVE_APP_NAME,
+    agent=root_agent,
+    session_service=adk_agent._session_manager._session_service,
+    artifact_service=adk_agent._artifact_service,
+    memory_service=adk_agent._memory_service,
+    credential_service=adk_agent._credential_service,
+    auto_create_session=True,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -124,9 +145,81 @@ app.mount("/download", StaticFiles(directory=EXPORT_DIR), name="download")
 async def healthz():
     return {
         "status": "ok",
+        "live_app_name": LIVE_APP_NAME,
         "copilotkit_path": ADK_ENDPOINT_PATH,
+        "live_ws_path": "/run_live",
         "upload_path": "/upload-ad",
     }
+
+@app.websocket("/run_live")
+async def run_live(
+    websocket: WebSocket,
+    app_name: str = Query(default=LIVE_APP_NAME),
+    user_id: str = Query(default="studio_user_01"),
+    session_id: str = Query(...),
+    modality: Literal["TEXT", "AUDIO"] = Query(default="TEXT"),
+    proactive_audio: bool | None = Query(default=None),
+    enable_affective_dialog: bool | None = Query(default=None),
+    enable_session_resumption: bool | None = Query(default=None),
+):
+    await websocket.accept()
+    live_request_queue = LiveRequestQueue()
+
+    async def forward_events():
+        run_config = RunConfig(
+            response_modalities=[modality],
+            proactivity=(
+                types.ProactivityConfig(proactive_audio=proactive_audio)
+                if proactive_audio is not None
+                else None
+            ),
+            enable_affective_dialog=enable_affective_dialog,
+            session_resumption=(
+                types.SessionResumptionConfig(transparent=enable_session_resumption)
+                if enable_session_resumption is not None
+                else None
+            ),
+        )
+        async with aclosing(
+            live_runner.run_live(
+                user_id=user_id,
+                session_id=session_id,
+                live_request_queue=live_request_queue,
+                run_config=run_config,
+            )
+        ) as agen:
+            async for event in agen:
+                await websocket.send_text(
+                    event.model_dump_json(exclude_none=True, by_alias=True)
+                )
+
+    async def process_messages():
+        try:
+            while True:
+                data = await websocket.receive_text()
+                live_request_queue.send(LiveRequest.model_validate_json(data))
+        except ValidationError:
+            # Invalid client message should not crash the whole server.
+            await websocket.send_text(
+                '{"error":"Invalid live request payload; expected LiveRequest JSON."}'
+            )
+
+    tasks = [
+        asyncio.create_task(forward_events()),
+        asyncio.create_task(process_messages()),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    try:
+        for task in done:
+            task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        traceback.print_exc()
+        await websocket.close(code=1011, reason=str(exc)[:123])
+    finally:
+        for task in pending:
+            task.cancel()
 
 @app.post("/upload-ad")
 async def upload_ad(request: Request, file: UploadFile = File(...)):

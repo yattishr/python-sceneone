@@ -48,15 +48,15 @@ pip install -r requirements.txt
 # Option A: Google AI API key
 GOOGLE_API_KEY=your_key_here
 # (or GEMINI_API_KEY=your_key_here)
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-12-2025
 
 # Option B: Vertex AI
 GOOGLE_CLOUD_PROJECT=your_project_id
 GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
-Note: preview native-audio model IDs may not support `generateContent` in this
-chat pipeline. Use a text/chat-capable model (default is `gemini-2.5-flash`).
+Note: this project's Live lane uses `run_live` WebSocket mode. Use a Live-capable
+model (default is `gemini-2.5-flash-native-audio-preview-12-2025`).
 
 3. Install frontend dependencies.
 
@@ -97,6 +97,11 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 
 # Next.js server-side Copilot proxy target for ADK endpoint
 COPILOTKIT_AGENT_URL=http://localhost:8000/copilotkit
+
+# Live lane websocket query params
+NEXT_PUBLIC_ADK_LIVE_APP_NAME=scene_one_agent
+NEXT_PUBLIC_ADK_LIVE_USER_ID=studio_user_01
+NEXT_PUBLIC_ADK_LIVE_MODALITY=AUDIO
 ```
 
 If you see `HTTP 404 {"detail":"Not Found"}` in browser console for agent execution,
@@ -107,6 +112,11 @@ Canonical CopilotKit request flow:
 1. Browser calls `POST /api/copilotkit` on Next.js (`localhost:3000`).
 2. Next.js route proxies to `POST /copilotkit` on FastAPI (`localhost:8000`).
 3. FastAPI route is registered by `add_adk_fastapi_endpoint(..., path="/copilotkit")`.
+
+Live lane request flow:
+1. Browser opens `ws://localhost:8000/run_live?...`.
+2. FastAPI `/run_live` forwards to ADK `Runner.run_live(...)`.
+3. Native-audio model streams events over the same websocket.
 
 Open `http://localhost:3000`.
 

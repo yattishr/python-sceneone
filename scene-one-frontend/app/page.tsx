@@ -1,8 +1,7 @@
 "use client"
 import { CopilotChat } from "@copilotkit/react-ui";
-import { useCopilotAction, useCopilotChat, useCopilotReadable } from "@copilotkit/react-core";
+import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
 import { useEffect, useState, useRef } from "react";
-import { ImageMessage, MessageRole, TextMessage } from "@copilotkit/runtime-client-gql";
 
 type AssetCard = {
   productName: string;
@@ -25,8 +24,13 @@ type BrowserSpeechRecognition = {
 type SpeechRecognitionFactory = new () => BrowserSpeechRecognition;
 
 const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+const LIVE_APP_NAME = process.env.NEXT_PUBLIC_ADK_LIVE_APP_NAME ?? "scene_one_agent";
+const LIVE_USER_ID = process.env.NEXT_PUBLIC_ADK_LIVE_USER_ID ?? "studio_user_01";
+const LIVE_RESPONSE_MODALITY = process.env.NEXT_PUBLIC_ADK_LIVE_MODALITY ?? "AUDIO";
 const RECORDING_DURATION_MS = 10_000;
 const SPEECH_SEND_COOLDOWN_MS = 1200;
+const LIVE_INPUT_SAMPLE_RATE = 16000;
+const FRAME_STREAM_INTERVAL_MS = 1200;
 
 function pickRecorderMimeType(): string | undefined {
   const candidates = [
@@ -45,23 +49,186 @@ function extensionFromMimeType(mimeType: string): string {
 }
 
 export default function Page() {
-  const { appendMessage, isLoading } = useCopilotChat();
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const liveSocketRef = useRef<WebSocket | null>(null);
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const isSessionActiveRef = useRef(false);
   const lastSpeechSendAtRef = useRef(0);
+  const frameIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const nextOutputPlayTimeRef = useRef(0);
+  const micAudioContextRef = useRef<AudioContext | null>(null);
+  const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const lastDirectorTextRef = useRef("");
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [visionLogs, setVisionLogs] = useState<string[]>(["[SYSTEM]: Awaiting live camera signal"]);
+  const [liveFeedLogs, setLiveFeedLogs] = useState<string[]>([]);
   const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
   const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
+  const [liveStatus, setLiveStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
+
+  const pushStatusLog = (message: string) => {
+    setVisionLogs((prev) => [message, ...prev].slice(0, 6));
+  };
+
+  const pushLiveFeedLog = (message: string) => {
+    setLiveFeedLogs((prev) => [message, ...prev].slice(0, 40));
+  };
 
   const getSpeechRecognitionFactory = (): SpeechRecognitionFactory | null => {
     if (typeof window === "undefined") return null;
     const candidate = (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition;
     return candidate ?? null;
+  };
+
+  const decodeBase64ToUint8Array = (base64: string): Uint8Array => {
+    const normalized = base64.replace(/_/g, "/").replace(/-/g, "+");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  };
+
+  const getOutputAudioContext = async (): Promise<AudioContext> => {
+    if (!outputAudioContextRef.current) {
+      outputAudioContextRef.current = new AudioContext();
+      nextOutputPlayTimeRef.current = outputAudioContextRef.current.currentTime;
+    }
+    if (outputAudioContextRef.current.state === "suspended") {
+      await outputAudioContextRef.current.resume();
+    }
+    return outputAudioContextRef.current;
+  };
+
+  const downsampleFloat32 = (
+    input: Float32Array,
+    inputSampleRate: number,
+    outputSampleRate: number
+  ): Float32Array => {
+    if (outputSampleRate >= inputSampleRate) {
+      return input;
+    }
+    const ratio = inputSampleRate / outputSampleRate;
+    const newLength = Math.round(input.length / ratio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetBuffer = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+      let accum = 0;
+      let count = 0;
+      for (let i = offsetBuffer; i < nextOffsetBuffer && i < input.length; i += 1) {
+        accum += input[i];
+        count += 1;
+      }
+      result[offsetResult] = count > 0 ? accum / count : 0;
+      offsetResult += 1;
+      offsetBuffer = nextOffsetBuffer;
+    }
+    return result;
+  };
+
+  const float32ToPcm16 = (samples: Float32Array): Uint8Array => {
+    const buffer = new ArrayBuffer(samples.length * 2);
+    const view = new DataView(buffer);
+    for (let i = 0; i < samples.length; i += 1) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Uint8Array(buffer);
+  };
+
+  const uint8ToBase64 = (bytes: Uint8Array): string => {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  };
+
+  const enqueuePcm16Audio = async (base64Data: string, sampleRate = 24000) => {
+    const context = await getOutputAudioContext();
+    const bytes = decodeBase64ToUint8Array(base64Data);
+    if (bytes.length < 2) {
+      return;
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const sampleCount = Math.floor(bytes.byteLength / 2);
+    const channelData = new Float32Array(sampleCount);
+    for (let i = 0; i < sampleCount; i += 1) {
+      channelData[i] = view.getInt16(i * 2, true) / 32768;
+    }
+
+    const audioBuffer = context.createBuffer(1, channelData.length, sampleRate);
+    audioBuffer.copyToChannel(channelData, 0);
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(context.destination);
+    const startAt = Math.max(context.currentTime, nextOutputPlayTimeRef.current);
+    source.start(startAt);
+    nextOutputPlayTimeRef.current = startAt + audioBuffer.duration;
+  };
+
+  const stopMicStreaming = () => {
+    if (micProcessorRef.current) {
+      micProcessorRef.current.disconnect();
+      micProcessorRef.current.onaudioprocess = null;
+      micProcessorRef.current = null;
+    }
+    if (micSourceRef.current) {
+      micSourceRef.current.disconnect();
+      micSourceRef.current = null;
+    }
+    if (micAudioContextRef.current) {
+      void micAudioContextRef.current.close();
+      micAudioContextRef.current = null;
+    }
+  };
+
+  const startMicStreaming = async (stream: MediaStream) => {
+    const context = new AudioContext();
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+
+    const micTrack = stream.getAudioTracks()[0];
+    if (!micTrack) {
+      return;
+    }
+    const audioStream = new MediaStream([micTrack]);
+    const source = context.createMediaStreamSource(audioStream);
+    const processor = context.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (event) => {
+      if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const input = event.inputBuffer.getChannelData(0);
+      const downsampled = downsampleFloat32(input, context.sampleRate, LIVE_INPUT_SAMPLE_RATE);
+      const pcmBytes = float32ToPcm16(downsampled);
+      if (pcmBytes.length === 0) {
+        return;
+      }
+      sendLivePayload({
+        blob: {
+          mime_type: `audio/pcm;rate=${LIVE_INPUT_SAMPLE_RATE}`,
+          data: uint8ToBase64(pcmBytes),
+        },
+      });
+    };
+
+    source.connect(processor);
+    processor.connect(context.destination);
+    micAudioContextRef.current = context;
+    micSourceRef.current = source;
+    micProcessorRef.current = processor;
   };
 
   const captureCurrentVideoFrame = (): string | null => {
@@ -81,8 +248,31 @@ export default function Page() {
     }
 
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL("image/png");
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
     return dataUrl.split(",")[1] ?? null;
+  };
+
+  const sendLivePayload = (payload: unknown) => {
+    if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    liveSocketRef.current.send(JSON.stringify(payload));
+  };
+
+  const startFrameStreaming = () => {
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+    }
+    frameIntervalRef.current = setInterval(() => {
+      void sendFrameToDirector();
+    }, FRAME_STREAM_INTERVAL_MS);
+  };
+
+  const stopFrameStreaming = () => {
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
   };
 
   const sendFrameToDirector = async () => {
@@ -90,14 +280,12 @@ export default function Page() {
     if (!imageBytes) {
       return;
     }
-
-    await appendMessage(
-      new ImageMessage({
-        role: MessageRole.User,
-        format: "png",
-        bytes: imageBytes,
-      }),
-    );
+    sendLivePayload({
+      blob: {
+        mime_type: "image/jpeg",
+        data: imageBytes,
+      },
+    });
   };
 
   const sendDirectorMessage = async (content: string) => {
@@ -105,13 +293,90 @@ export default function Page() {
     if (!trimmed) {
       return;
     }
+    sendLivePayload({
+      content: {
+        role: "user",
+        parts: [{ text: trimmed }],
+      },
+    });
+  };
 
-    await appendMessage(
-      new TextMessage({
-        role: MessageRole.User,
-        content: trimmed,
-      }),
-    );
+  const getLiveSocketUrl = (sessionId: string) => {
+    const wsBase = BACKEND_BASE_URL
+      .replace(/^http:\/\//i, "ws://")
+      .replace(/^https:\/\//i, "wss://")
+      .replace(/\/+$/, "");
+    const params = new URLSearchParams({
+      app_name: LIVE_APP_NAME,
+      user_id: LIVE_USER_ID,
+      session_id: sessionId,
+      modality: LIVE_RESPONSE_MODALITY,
+    });
+    return `${wsBase}/run_live?${params.toString()}`;
+  };
+
+  const closeLiveSocket = () => {
+    if (liveSocketRef.current) {
+      liveSocketRef.current.close();
+      liveSocketRef.current = null;
+    }
+    setLiveStatus("disconnected");
+  };
+
+  const connectLiveSocket = async () => {
+    const sessionId = crypto.randomUUID();
+    const wsUrl = getLiveSocketUrl(sessionId);
+    setLiveStatus("connecting");
+
+    await new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(wsUrl);
+      liveSocketRef.current = socket;
+
+      socket.onopen = () => {
+        setLiveStatus("connected");
+        pushStatusLog("[SYSTEM]: Live agent channel connected");
+        resolve();
+      };
+
+      socket.onerror = (event) => {
+        console.error("Live socket error", event);
+        pushStatusLog("[ERROR]: Live agent connection failed");
+        reject(new Error("Live WebSocket connection failed."));
+      };
+
+      socket.onclose = () => {
+        setLiveStatus("disconnected");
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          const parts = payload?.content?.parts;
+          if (Array.isArray(parts)) {
+            for (const part of parts) {
+              const inlineData = part?.inlineData;
+              const mimeType = inlineData?.mimeType || "";
+              const audioData = inlineData?.data;
+              if (typeof audioData === "string" && mimeType.includes("audio/pcm")) {
+                void enqueuePcm16Audio(audioData);
+              }
+            }
+            const textParts = parts
+              .map((part: any) => part?.text)
+              .filter((value: unknown) => typeof value === "string" && value.trim().length > 0);
+            if (textParts.length > 0) {
+              const directorText = textParts.join(" ").trim();
+              if (directorText && directorText !== lastDirectorTextRef.current) {
+                lastDirectorTextRef.current = directorText;
+                pushLiveFeedLog(`[DIRECTOR]: ${directorText}`);
+              }
+            }
+          }
+        } catch {
+          // Ignore non-JSON or non-text live payloads.
+        }
+      };
+    });
   };
 
   const stopSpeechRecognition = () => {
@@ -127,7 +392,7 @@ export default function Page() {
     const SpeechRecognitionCtor = getSpeechRecognitionFactory();
     if (!SpeechRecognitionCtor) {
       setSpeechStatus("unsupported");
-      setVisionLogs((prev) => ["[WARN]: Browser speech recognition unavailable", ...prev].slice(0, 6));
+      pushStatusLog("[WARN]: Browser speech recognition unavailable");
       return;
     }
 
@@ -154,7 +419,7 @@ export default function Page() {
       }
 
       lastSpeechSendAtRef.current = now;
-      setVisionLogs((prev) => [`[VOICE]: ${finalTranscript}`, ...prev].slice(0, 6));
+      pushLiveFeedLog(`[VOICE]: ${finalTranscript}`);
 
       try {
         await sendFrameToDirector();
@@ -163,13 +428,13 @@ export default function Page() {
         );
       } catch (error) {
         console.error("Failed to send transcript to director", error);
-        setVisionLogs((prev) => ["[ERROR]: Could not send speech to director", ...prev].slice(0, 6));
+        pushStatusLog("[ERROR]: Could not send speech to director");
       }
     };
 
     recognition.onerror = (event) => {
       console.error("Speech recognition error", event);
-      setVisionLogs((prev) => ["[ERROR]: Speech recognition failed", ...prev].slice(0, 6));
+      pushStatusLog("[ERROR]: Speech recognition failed");
     };
 
     recognition.onend = () => {
@@ -190,15 +455,16 @@ export default function Page() {
       isSessionActiveRef.current = true;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        await videoRef.current.play();
         setIsCameraActive(true);
-        setVisionLogs((prev) => [
-          "[SYSTEM]: Camera channel linked",
-          "[SYSTEM]: Voice command channel ready",
-          "[SYSTEM]: Vision agent warmup complete",
-          ...prev
-        ].slice(0, 6));
+        pushStatusLog("[SYSTEM]: Camera channel linked");
+        pushStatusLog("[SYSTEM]: Voice command channel ready");
+        pushStatusLog("[SYSTEM]: Vision agent warmup complete");
       }
 
+      await connectLiveSocket();
+      await startMicStreaming(stream);
+      startFrameStreaming();
       startSpeechRecognition();
       await sendFrameToDirector();
       await sendDirectorMessage(
@@ -206,13 +472,16 @@ export default function Page() {
       );
     } catch (err) {
       console.error("Failed to start production", err);
-      setVisionLogs((prev) => ["[ERROR]: Camera permission denied or unavailable", ...prev].slice(0, 6));
+      pushStatusLog("[ERROR]: Camera permission denied or unavailable");
     }
   }
 
   function stopProduction() {
     isSessionActiveRef.current = false;
     stopSpeechRecognition();
+    stopMicStreaming();
+    stopFrameStreaming();
+    closeLiveSocket();
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -224,14 +493,14 @@ export default function Page() {
       streamRef.current = null;
       setIsCameraActive(false);
       setElapsedSeconds(0);
-      setVisionLogs((prev) => ["[SYSTEM]: Camera feed closed", ...prev].slice(0, 6));
+      pushStatusLog("[SYSTEM]: Camera feed closed");
     }
   }
 
   useCopilotReadable({
     description: "The current visual state of the production studio",
     value: isCameraActive
-      ? `Camera is LIVE. Speech channel is ${speechStatus}. ${isLoading ? "Director is responding." : "Director is idle."}`
+      ? `Camera is LIVE. Speech channel is ${speechStatus}. Live socket is ${liveStatus}.`
       : "Camera is OFF"
   });
 
@@ -244,7 +513,7 @@ export default function Page() {
       { name: "final_script", type: "string" }
     ],
     handler: async ({ product_name, final_script }) => {
-      setVisionLogs((prev) => ["🎬 [ACTION]: Recording 10s audio clip...", ...prev].slice(0, 6));
+      pushStatusLog("🎬 [ACTION]: Recording 10s audio clip...");
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -293,10 +562,10 @@ export default function Page() {
               },
               ...prev
             ]);
-            setVisionLogs((prev) => [`[SUCCESS]: ${product_name} ad finalized`, ...prev].slice(0, 6));
+            pushStatusLog(`[SUCCESS]: ${product_name} ad finalized`);
           } catch (error) {
             console.error("Upload failed", error);
-            setVisionLogs((prev) => ["[ERROR]: Production Hub upload failed", ...prev].slice(0, 6));
+            pushStatusLog("[ERROR]: Production Hub upload failed");
           } finally {
             stream.getTracks().forEach((t) => t.stop());
           }
@@ -310,7 +579,7 @@ export default function Page() {
         }, RECORDING_DURATION_MS);
       } catch (error) {
         console.error("Recording setup failed", error);
-        setVisionLogs((prev) => ["[ERROR]: Microphone permission denied or unavailable", ...prev].slice(0, 6));
+        pushStatusLog("[ERROR]: Microphone permission denied or unavailable");
       }
     }
   });
@@ -349,7 +618,13 @@ export default function Page() {
 
         <section className="grid grid-cols-1 gap-6 lg:grid-cols-12">
           <article className="obsidian-panel relative overflow-hidden rounded-3xl lg:col-span-7">
-            <video ref={videoRef} autoPlay muted className="aspect-video w-full rounded-3xl bg-black object-cover" />
+            <video
+              ref={videoRef}
+              autoPlay
+              muted
+              playsInline
+              className="aspect-video w-full rounded-3xl bg-black object-cover"
+            />
             <div className="hud-overlay">
               <div className="hud-top-row">
                 <div className="hud-chip hud-rec">
@@ -360,8 +635,8 @@ export default function Page() {
               </div>
               <div className={`scan-line ${isCameraActive ? "scan-line-active" : ""}`} />
               <div className="hud-logs">
-                {visionLogs.map((log) => (
-                  <p key={log} className="log-line">
+                {visionLogs.map((log, index) => (
+                  <p key={`${index}-${log}`} className="log-line">
                     {log}
                   </p>
                 ))}
@@ -378,6 +653,26 @@ export default function Page() {
               }}
             />
           </aside>
+        </section>
+
+        <section className="obsidian-panel rounded-3xl p-4 md:p-5">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="dock-title text-lg md:text-xl">Live Feed</h2>
+            <p className="dock-subtitle">Voice + director transcript stream</p>
+          </div>
+          <div className="live-feed-scroll">
+            {liveFeedLogs.length === 0 ? (
+              <div className="asset-card asset-card-empty">
+                <p>Live transcript events will appear here once the session starts.</p>
+              </div>
+            ) : (
+              liveFeedLogs.map((log, index) => (
+                <p key={`${index}-${log}`} className="live-feed-line">
+                  {log}
+                </p>
+              ))
+            )}
+          </div>
         </section>
 
         <section className="obsidian-panel rounded-3xl p-4 md:p-5">

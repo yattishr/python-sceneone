@@ -211,6 +211,27 @@ body {
   padding-bottom: 0.3rem;
 }
 
+.live-feed-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+
+.live-feed-line {
+  backdrop-filter: blur(6px);
+  background: rgba(2, 6, 23, 0.65);
+  border-left: 2px solid var(--amber-glow);
+  color: #f8fafc;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  margin: 0;
+  padding: 0.4rem 0.55rem;
+}
+
 .asset-card {
   background: rgba(2, 6, 23, 0.7);
   border: 1px solid var(--circuit);
