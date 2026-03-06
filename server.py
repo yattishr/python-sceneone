@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from contextlib import aclosing
 from typing import Literal
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -85,6 +86,8 @@ app.add_middleware(
 # Create a directory for exported audio files
 EXPORT_DIR = "exports/audio"
 os.makedirs(EXPORT_DIR, exist_ok=True)
+SCRIPT_DIR = "exports/scripts"
+os.makedirs(SCRIPT_DIR, exist_ok=True)
 TARGET_DURATION_MS = 10_000
 SILENCE_THRESHOLD_DBFS = -40
 TRIM_PADDING_MS = 100
@@ -153,6 +156,38 @@ def trim_and_clean_audio(file_path: str, target_duration_ms: int = TARGET_DURATI
 
 # Mount the folder so files ace accessible via http://localhost:8000/download/ad.wav
 app.mount("/download", StaticFiles(directory=EXPORT_DIR), name="download")
+app.mount("/scripts", StaticFiles(directory=SCRIPT_DIR), name="scripts")
+
+def _iso_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+def _parse_script_file(path: Path) -> dict:
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    lines = content.splitlines()
+    product_name = "Untitled Product"
+    final_script = content.strip()
+    if lines and lines[0].startswith("PRODUCT:"):
+        product_name = lines[0].split(":", 1)[1].strip() or product_name
+    marker = "--- SCRIPT ---"
+    marker_index = content.find(marker)
+    if marker_index >= 0:
+        final_script = content[marker_index + len(marker):].strip()
+    return {
+        "filename": path.name,
+        "url": f"/scripts/{path.name}",
+        "product_name": product_name,
+        "final_script": final_script,
+        "modified_at": _iso_utc(path.stat().st_mtime),
+        "size_bytes": path.stat().st_size,
+    }
+
+def _parse_audio_file(path: Path) -> dict:
+    return {
+        "filename": path.name,
+        "url": f"/download/{path.name}",
+        "modified_at": _iso_utc(path.stat().st_mtime),
+        "size_bytes": path.stat().st_size,
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -162,6 +197,28 @@ async def healthz():
         "copilotkit_path": ADK_ENDPOINT_PATH,
         "live_ws_path": "/run_live",
         "upload_path": "/upload-ad",
+        "assets_path": "/assets",
+    }
+
+@app.get("/assets")
+async def list_assets():
+    base_audio = Path(EXPORT_DIR)
+    base_scripts = Path(SCRIPT_DIR)
+
+    audio_files = sorted(
+        [p for p in base_audio.glob("*.wav") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    script_files = sorted(
+        [p for p in base_scripts.glob("*.txt") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    return {
+        "audio": [_parse_audio_file(path) for path in audio_files],
+        "scripts": [_parse_script_file(path) for path in script_files],
     }
 
 @app.websocket("/run_live")

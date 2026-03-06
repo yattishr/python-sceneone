@@ -8,6 +8,7 @@ type AssetCard = {
   finalScript: string;
   timestamp: string;
   wavUrl: string;
+  scriptUrl?: string;
 };
 
 type BrowserSpeechRecognition = {
@@ -26,6 +27,21 @@ type CaptureRequest = {
   product_name?: string;
   final_script?: string;
 };
+type BackendAudioAsset = {
+  filename: string;
+  url: string;
+  modified_at: string;
+  size_bytes: number;
+};
+type BackendScriptAsset = {
+  filename: string;
+  url: string;
+  product_name: string;
+  final_script: string;
+  modified_at: string;
+  size_bytes: number;
+};
+
 
 const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const LIVE_APP_NAME = process.env.NEXT_PUBLIC_ADK_LIVE_APP_NAME ?? "scene_one_agent";
@@ -35,6 +51,7 @@ const RECORDING_DURATION_MS = 10_000;
 const SPEECH_SEND_COOLDOWN_MS = 1200;
 const LIVE_INPUT_SAMPLE_RATE = 16000;
 const FRAME_STREAM_INTERVAL_MS = 1200;
+const ASSET_DOCK_STORAGE_KEY = "sceneone.assetDock.v1";
 const DIRECTOR_DEFAULT_SAMPLE_RATE = 24000;
 const DIRECTOR_AUDIO_CHANNELS = 1;
 const PCM16_BYTES_PER_SAMPLE = 2;
@@ -394,6 +411,17 @@ export default function Page() {
     };
   };
 
+  const safeProductKey = (value: string): string => {
+    return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "untitled";
+  };
+
+  const absoluteBackendUrl = (path: string): string => {
+    if (/^https?:\/\//i.test(path)) {
+      return path;
+    }
+    return `${BACKEND_BASE_URL.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+  };
+
   const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
     const parts = payload?.content?.parts;
     if (Array.isArray(parts)) {
@@ -731,6 +759,113 @@ export default function Page() {
   });
 
   useEffect(() => {
+    let isCancelled = false;
+
+    const restoreFromLocalStorage = () => {
+      if (typeof window === "undefined") {
+        return;
+      }
+      try {
+        const raw = window.localStorage.getItem(ASSET_DOCK_STORAGE_KEY);
+        if (!raw) {
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          return;
+        }
+        const restored = parsed
+          .filter((item): item is AssetCard => {
+            return Boolean(
+              item &&
+              typeof item.productName === "string" &&
+              typeof item.finalScript === "string" &&
+              typeof item.timestamp === "string" &&
+              typeof item.wavUrl === "string" &&
+              (typeof item.scriptUrl === "undefined" || typeof item.scriptUrl === "string")
+            );
+          })
+          .slice(0, 40);
+        if (restored.length > 0 && !isCancelled) {
+          setAssetCards(restored);
+        }
+      } catch (error) {
+        console.error("Failed to restore asset dock", error);
+      }
+    };
+
+    const loadFromBackend = async () => {
+      try {
+        const response = await fetch(`${BACKEND_BASE_URL}/assets`);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch assets: ${response.status}`);
+        }
+        const payload = await response.json() as {
+          audio?: BackendAudioAsset[];
+          scripts?: BackendScriptAsset[];
+        };
+
+        const audioItems = Array.isArray(payload.audio) ? payload.audio : [];
+        const scriptItems = Array.isArray(payload.scripts) ? payload.scripts : [];
+        const audioMap = new Map<string, BackendAudioAsset[]>();
+        for (const audio of audioItems) {
+          if (typeof audio.filename !== "string" || typeof audio.url !== "string") {
+            continue;
+          }
+          const match = /^sceneone_(.+)_[a-f0-9]{8}\.wav$/i.exec(audio.filename);
+          if (!match) {
+            continue;
+          }
+          const key = match[1];
+          const existing = audioMap.get(key) ?? [];
+          existing.push(audio);
+          audioMap.set(key, existing);
+        }
+
+        const cards: AssetCard[] = scriptItems
+          .filter((script) => typeof script.product_name === "string" && typeof script.final_script === "string")
+          .map((script) => {
+            const key = safeProductKey(script.product_name);
+            const audio = (audioMap.get(key) ?? [])[0];
+            return {
+              productName: script.product_name,
+              finalScript: script.final_script,
+              timestamp: new Date(script.modified_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+              wavUrl: audio ? absoluteBackendUrl(audio.url) : "",
+              scriptUrl: typeof script.url === "string" ? absoluteBackendUrl(script.url) : undefined,
+            };
+          })
+          .slice(0, 40);
+
+        if (cards.length > 0 && !isCancelled) {
+          setAssetCards(cards);
+          return;
+        }
+      } catch (error) {
+        console.error("Failed to load assets from backend", error);
+      }
+
+      restoreFromLocalStorage();
+    };
+
+    void loadFromBackend();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(ASSET_DOCK_STORAGE_KEY, JSON.stringify(assetCards));
+    } catch (error) {
+      console.error("Failed to persist asset dock", error);
+    }
+  }, [assetCards]);
+
+  useEffect(() => {
     if (!isCameraActive) {
       return;
     }
@@ -837,9 +972,20 @@ export default function Page() {
                   <p className="asset-name">{asset.productName}</p>
                   <p className="asset-time">{asset.timestamp}</p>
                   <div className="mt-4 flex gap-2">
-                    <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>
-                      Download .WAV
-                    </a>
+                    {asset.wavUrl ? (
+                      <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>
+                        Download .WAV
+                      </a>
+                    ) : (
+                      <button className="studio-btn studio-btn-secondary" disabled>
+                        WAV pending
+                      </button>
+                    )}
+                    {asset.scriptUrl ? (
+                      <a className="studio-btn studio-btn-secondary" href={asset.scriptUrl} download>
+                        Download .TXT
+                      </a>
+                    ) : null}
                     <button
                       className="studio-btn studio-btn-secondary"
                       onClick={async () => navigator.clipboard.writeText(asset.finalScript)}
