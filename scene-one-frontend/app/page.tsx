@@ -39,6 +39,7 @@ const DIRECTOR_DEFAULT_SAMPLE_RATE = 24000;
 const DIRECTOR_AUDIO_CHANNELS = 1;
 const PCM16_BYTES_PER_SAMPLE = 2;
 const MAX_DIRECTOR_BUFFER_MS = 30_000;
+const TTS_WARMUP_MS = 800;
 
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -431,9 +432,20 @@ export default function Page() {
 
     isCaptureInProgressRef.current = true;
     lastCaptureKeyRef.current = captureKey;
-    pushStatusLog(`🎬 [ACTION]: Exporting director audio clip (${source})...`);
+    pushStatusLog(`🎬 [ACTION]: Rendering script voiceover (${source})...`);
 
     try {
+      if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
+        throw new Error("Live director socket is not connected.");
+      }
+
+      directorPcmChunksRef.current = [];
+      directorPcmBytesRef.current = 0;
+      await sendDirectorMessage(
+        `Read this ad script verbatim with no intro or outro. Output only the script as spoken audio:\n${finalScript}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, RECORDING_DURATION_MS + TTS_WARMUP_MS));
+
       const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
       const wantedBytes = Math.floor(
         (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * RECORDING_DURATION_MS) / 1000
