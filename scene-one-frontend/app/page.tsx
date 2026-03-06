@@ -22,6 +22,10 @@ type BrowserSpeechRecognition = {
 };
 
 type SpeechRecognitionFactory = new () => BrowserSpeechRecognition;
+type CaptureRequest = {
+  product_name?: string;
+  final_script?: string;
+};
 
 const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const LIVE_APP_NAME = process.env.NEXT_PUBLIC_ADK_LIVE_APP_NAME ?? "scene_one_agent";
@@ -31,22 +35,10 @@ const RECORDING_DURATION_MS = 10_000;
 const SPEECH_SEND_COOLDOWN_MS = 1200;
 const LIVE_INPUT_SAMPLE_RATE = 16000;
 const FRAME_STREAM_INTERVAL_MS = 1200;
-
-function pickRecorderMimeType(): string | undefined {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-  ];
-  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
-}
-
-function extensionFromMimeType(mimeType: string): string {
-  if (mimeType.includes("ogg")) return "ogg";
-  if (mimeType.includes("mp4")) return "m4a";
-  return "webm";
-}
+const DIRECTOR_DEFAULT_SAMPLE_RATE = 24000;
+const DIRECTOR_AUDIO_CHANNELS = 1;
+const PCM16_BYTES_PER_SAMPLE = 2;
+const MAX_DIRECTOR_BUFFER_MS = 30_000;
 
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -62,6 +54,11 @@ export default function Page() {
   const micProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const lastDirectorTextRef = useRef("");
+  const isCaptureInProgressRef = useRef(false);
+  const lastCaptureKeyRef = useRef("");
+  const directorPcmChunksRef = useRef<Uint8Array[]>([]);
+  const directorPcmBytesRef = useRef(0);
+  const directorSampleRateRef = useRef(DIRECTOR_DEFAULT_SAMPLE_RATE);
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -94,6 +91,87 @@ export default function Page() {
       out[i] = binary.charCodeAt(i);
     }
     return out;
+  };
+
+  const parsePcmSampleRate = (mimeType: string): number => {
+    const match = /rate=(\d+)/i.exec(mimeType);
+    if (!match) {
+      return DIRECTOR_DEFAULT_SAMPLE_RATE;
+    }
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DIRECTOR_DEFAULT_SAMPLE_RATE;
+  };
+
+  const appendDirectorPcm = (bytes: Uint8Array, sampleRate: number) => {
+    if (bytes.length < 2) {
+      return;
+    }
+
+    if (directorSampleRateRef.current !== sampleRate) {
+      directorPcmChunksRef.current = [];
+      directorPcmBytesRef.current = 0;
+      directorSampleRateRef.current = sampleRate;
+    }
+
+    directorPcmChunksRef.current.push(bytes);
+    directorPcmBytesRef.current += bytes.length;
+
+    const maxBytes = Math.floor(
+      (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * MAX_DIRECTOR_BUFFER_MS) / 1000
+    );
+    while (directorPcmBytesRef.current > maxBytes && directorPcmChunksRef.current.length > 1) {
+      const dropped = directorPcmChunksRef.current.shift();
+      if (dropped) {
+        directorPcmBytesRef.current -= dropped.length;
+      }
+    }
+  };
+
+  const getRecentDirectorPcm = (maxBytes: number): Uint8Array => {
+    if (maxBytes <= 0 || directorPcmBytesRef.current === 0) {
+      return new Uint8Array(0);
+    }
+    const takeBytes = Math.min(maxBytes, directorPcmBytesRef.current);
+    const merged = new Uint8Array(directorPcmBytesRef.current);
+    let offset = 0;
+    for (const chunk of directorPcmChunksRef.current) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return merged.slice(merged.length - takeBytes);
+  };
+
+  const pcm16ToWavBlob = (pcmBytes: Uint8Array, sampleRate: number): Blob => {
+    const headerSize = 44;
+    const wav = new ArrayBuffer(headerSize + pcmBytes.length);
+    const view = new DataView(wav);
+
+    const writeAscii = (offset: number, text: string) => {
+      for (let i = 0; i < text.length; i += 1) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    };
+
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + pcmBytes.length, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true); // PCM fmt chunk size
+    view.setUint16(20, 1, true); // PCM format
+    view.setUint16(22, DIRECTOR_AUDIO_CHANNELS, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(
+      28,
+      sampleRate * DIRECTOR_AUDIO_CHANNELS * PCM16_BYTES_PER_SAMPLE,
+      true
+    );
+    view.setUint16(32, DIRECTOR_AUDIO_CHANNELS * PCM16_BYTES_PER_SAMPLE, true);
+    view.setUint16(34, 16, true); // bits per sample
+    writeAscii(36, "data");
+    view.setUint32(40, pcmBytes.length, true);
+
+    new Uint8Array(wav, headerSize).set(pcmBytes);
+    return new Blob([wav], { type: "audio/wav" });
   };
 
   const getOutputAudioContext = async (): Promise<AudioContext> => {
@@ -153,12 +231,13 @@ export default function Page() {
     return btoa(binary);
   };
 
-  const enqueuePcm16Audio = async (base64Data: string, sampleRate = 24000) => {
+  const enqueuePcm16Audio = async (base64Data: string, sampleRate = DIRECTOR_DEFAULT_SAMPLE_RATE) => {
     const context = await getOutputAudioContext();
     const bytes = decodeBase64ToUint8Array(base64Data);
     if (bytes.length < 2) {
       return;
     }
+    appendDirectorPcm(bytes, sampleRate);
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const sampleCount = Math.floor(bytes.byteLength / 2);
     const channelData = new Float32Array(sampleCount);
@@ -301,6 +380,118 @@ export default function Page() {
     });
   };
 
+  const toCaptureRequest = (value: unknown): CaptureRequest | null => {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+    const candidate = value as Record<string, unknown>;
+    const productName = candidate.product_name;
+    const finalScript = candidate.final_script;
+    return {
+      product_name: typeof productName === "string" ? productName : undefined,
+      final_script: typeof finalScript === "string" ? finalScript : undefined,
+    };
+  };
+
+  const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
+    const parts = payload?.content?.parts;
+    if (Array.isArray(parts)) {
+      for (const part of parts) {
+        const functionCall = part?.functionCall ?? part?.function_call;
+        const fnName = functionCall?.name ?? functionCall?.functionName;
+        if (fnName !== "capture_ad_script") {
+          continue;
+        }
+        const argsRaw = functionCall?.args ?? functionCall?.arguments;
+        if (typeof argsRaw === "string") {
+          try {
+            return toCaptureRequest(JSON.parse(argsRaw));
+          } catch {
+            return null;
+          }
+        }
+        return toCaptureRequest(argsRaw);
+      }
+    }
+    return null;
+  };
+
+  const captureAndUploadAudio = async (request: CaptureRequest, source: "copilot" | "live") => {
+    if (isCaptureInProgressRef.current) {
+      pushStatusLog("[SYSTEM]: Capture already in progress");
+      return;
+    }
+
+    const productName = (request.product_name || "untitled").trim() || "untitled";
+    const finalScript = (request.final_script || lastDirectorTextRef.current || "No script text.").trim();
+    const captureKey = `${productName}::${finalScript}`;
+    if (captureKey === lastCaptureKeyRef.current) {
+      return;
+    }
+
+    isCaptureInProgressRef.current = true;
+    lastCaptureKeyRef.current = captureKey;
+    pushStatusLog(`🎬 [ACTION]: Exporting director audio clip (${source})...`);
+
+    try {
+      const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
+      const wantedBytes = Math.floor(
+        (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * RECORDING_DURATION_MS) / 1000
+      );
+      const recentPcm = getRecentDirectorPcm(wantedBytes);
+      if (recentPcm.length < sampleRate * PCM16_BYTES_PER_SAMPLE) {
+        throw new Error("No director audio captured yet. Let the director speak, then try again.");
+      }
+
+      const wavBlob = pcm16ToWavBlob(recentPcm, sampleRate);
+      const safeName = productName.replace(/\s+/g, "_").toLowerCase();
+      const formData = new FormData();
+      formData.append("file", wavBlob, `${safeName}.wav`);
+
+      const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        let detail = `Upload failed with status ${response.status}`;
+        try {
+          const payload = await response.json();
+          if (payload?.detail) {
+            detail = `${detail}: ${payload.detail}`;
+          }
+        } catch {
+          // non-JSON error response
+        }
+        throw new Error(detail);
+      }
+
+      const data = await response.json();
+      if (!data.download_url) {
+        throw new Error("Upload succeeded but no download URL returned.");
+      }
+
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      setAssetCards((prev) => [
+        {
+          productName,
+          finalScript,
+          timestamp: time,
+          wavUrl: data.download_url
+        },
+        ...prev
+      ]);
+      pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
+    } catch (error) {
+      isCaptureInProgressRef.current = false;
+      console.error("Director capture failed", error);
+      const message = error instanceof Error ? error.message : "Director audio export failed";
+      pushStatusLog(`[ERROR]: ${message}`);
+      return;
+    }
+
+    isCaptureInProgressRef.current = false;
+  };
+
   const getLiveSocketUrl = (sessionId: string) => {
     const wsBase = BACKEND_BASE_URL
       .replace(/^http:\/\//i, "ws://")
@@ -358,7 +549,7 @@ export default function Page() {
               const mimeType = inlineData?.mimeType || "";
               const audioData = inlineData?.data;
               if (typeof audioData === "string" && mimeType.includes("audio/pcm")) {
-                void enqueuePcm16Audio(audioData);
+                void enqueuePcm16Audio(audioData, parsePcmSampleRate(mimeType));
               }
             }
             const textParts = parts
@@ -371,6 +562,10 @@ export default function Page() {
                 pushLiveFeedLog(`[DIRECTOR]: ${directorText}`);
               }
             }
+          }
+          const captureRequest = extractCaptureRequestFromPayload(payload);
+          if (captureRequest) {
+            void captureAndUploadAudio(captureRequest, "live");
           }
         } catch {
           // Ignore non-JSON or non-text live payloads.
@@ -450,6 +645,9 @@ export default function Page() {
 
   async function startProduction() {
     try {
+      directorPcmChunksRef.current = [];
+      directorPcmBytesRef.current = 0;
+      directorSampleRateRef.current = DIRECTOR_DEFAULT_SAMPLE_RATE;
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       streamRef.current = stream;
       isSessionActiveRef.current = true;
@@ -482,6 +680,9 @@ export default function Page() {
     stopMicStreaming();
     stopFrameStreaming();
     closeLiveSocket();
+    directorPcmChunksRef.current = [];
+    directorPcmBytesRef.current = 0;
+    directorSampleRateRef.current = DIRECTOR_DEFAULT_SAMPLE_RATE;
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -513,74 +714,7 @@ export default function Page() {
       { name: "final_script", type: "string" }
     ],
     handler: async ({ product_name, final_script }) => {
-      pushStatusLog("🎬 [ACTION]: Recording 10s audio clip...");
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const mimeType = pickRecorderMimeType();
-        const mediaRecorder = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
-        const audioChunks: Blob[] = [];
-
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            audioChunks.push(event.data);
-          }
-        };
-
-        mediaRecorder.onstop = async () => {
-          const recorderMimeType = mediaRecorder.mimeType || mimeType || "audio/webm";
-          const extension = extensionFromMimeType(recorderMimeType);
-          const audioBlob = new Blob(audioChunks, { type: recorderMimeType });
-          const safeName = (product_name ?? "untitled").replace(/\s+/g, "_").toLowerCase();
-
-          const formData = new FormData();
-          formData.append("file", audioBlob, `${safeName}.${extension}`);
-
-          try {
-            const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
-              method: "POST",
-              body: formData,
-            });
-            if (!response.ok) {
-              throw new Error(`Upload failed with status ${response.status}`);
-            }
-
-            const data = await response.json();
-            if (!data.download_url) {
-              throw new Error("Upload succeeded but no download URL returned.");
-            }
-
-            const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-            setAssetCards((prev) => [
-              {
-                productName: product_name ?? "Untitled Product",
-                finalScript: final_script ?? "No script text.",
-                timestamp: time,
-                wavUrl: data.download_url
-              },
-              ...prev
-            ]);
-            pushStatusLog(`[SUCCESS]: ${product_name} ad finalized`);
-          } catch (error) {
-            console.error("Upload failed", error);
-            pushStatusLog("[ERROR]: Production Hub upload failed");
-          } finally {
-            stream.getTracks().forEach((t) => t.stop());
-          }
-        };
-
-        mediaRecorder.start();
-        setTimeout(() => {
-          if (mediaRecorder.state !== "inactive") {
-            mediaRecorder.stop();
-          }
-        }, RECORDING_DURATION_MS);
-      } catch (error) {
-        console.error("Recording setup failed", error);
-        pushStatusLog("[ERROR]: Microphone permission denied or unavailable");
-      }
+      await captureAndUploadAudio({ product_name, final_script }, "copilot");
     }
   });
 

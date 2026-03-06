@@ -4,6 +4,7 @@ import shutil
 import uuid
 import asyncio
 import traceback
+import logging
 from pathlib import Path
 from contextlib import aclosing
 from typing import Literal
@@ -14,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
+from pydub.exceptions import CouldntDecodeError
+from pydub.utils import which
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
@@ -29,6 +32,7 @@ from google.genai import types
 # Align env-loading behavior with `adk web .` so direct `server.py` runs
 # can resolve Gemini credentials from the project .env file.
 load_dotenv()
+logger = logging.getLogger("sceneone.server")
 
 def _validate_llm_auth_config() -> None:
     has_api_key = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
@@ -85,6 +89,15 @@ TARGET_DURATION_MS = 10_000
 SILENCE_THRESHOLD_DBFS = -40
 TRIM_PADDING_MS = 100
 FADE_MS = 50
+FFMPEG_BINARY = which("ffmpeg") or which("avconv")
+
+if not FFMPEG_BINARY:
+    logger.warning(
+        "[startup] ffmpeg not found. Browser uploads in webm/ogg/mp4 will fail. "
+        "Install ffmpeg or upload WAV."
+    )
+else:
+    logger.info("[startup] ffmpeg detected at: %s", FFMPEG_BINARY)
 
 def _safe_stem(filename: str) -> str:
     stem = Path(filename).stem or "untitled"
@@ -119,12 +132,12 @@ def trim_and_clean_audio(file_path: str, target_duration_ms: int = TARGET_DURATI
 
     leading_trim_ms = detect_leading_silence(
         audio,
-        silence_thresh=SILENCE_THRESHOLD_DBFS,
+        silence_threshold=SILENCE_THRESHOLD_DBFS,
         chunk_size=10,
     )
     trailing_trim_ms = detect_leading_silence(
         audio.reverse(),
-        silence_thresh=SILENCE_THRESHOLD_DBFS,
+        silence_threshold=SILENCE_THRESHOLD_DBFS,
         chunk_size=10,
     )
 
@@ -223,6 +236,10 @@ async def run_live(
 
 @app.post("/upload-ad")
 async def upload_ad(request: Request, file: UploadFile = File(...)):
+    print(
+        f"[upload-ad] received file='{file.filename}' "
+        f"content_type='{file.content_type}'"
+    )
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing audio filename.")
     if file.content_type and not file.content_type.startswith("audio/"):
@@ -233,14 +250,42 @@ async def upload_ad(request: Request, file: UploadFile = File(...)):
     temp_path = Path(f"temp_{uuid.uuid4().hex}{temp_suffix}")
     final_filename = f"sceneone_{safe_name}_{uuid.uuid4().hex[:8]}.wav"
     final_path = Path(EXPORT_DIR) / final_filename
+    is_probably_wav = temp_suffix.lower() == ".wav" or (file.content_type or "").lower() in {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/wave",
+    }
+
+    if not is_probably_wav and not FFMPEG_BINARY:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Server is missing ffmpeg. Install ffmpeg to process browser audio "
+                "formats (webm/ogg/mp4), or upload WAV."
+            ),
+        )
 
     try:
         with temp_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        temp_size = temp_path.stat().st_size if temp_path.exists() else 0
+        logger.info("[upload-ad] temp file written: %s bytes (%s)", temp_size, temp_path)
+        if temp_size == 0:
+            raise ValueError("Uploaded audio is empty (0 bytes).")
 
         processed_audio = trim_and_clean_audio(str(temp_path))
         processed_audio.export(str(final_path), format="wav")
+    except CouldntDecodeError as exc:
+        logger.exception("[upload-ad] could not decode audio file")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not decode uploaded audio. If you uploaded webm/ogg/mp4, "
+                "install ffmpeg on the backend."
+            ),
+        ) from exc
     except Exception as exc:
+        logger.exception("[upload-ad] failed while processing audio")
         raise HTTPException(status_code=500, detail=f"Failed to process audio: {exc}") from exc
     finally:
         if temp_path.exists():
