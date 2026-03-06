@@ -1,5 +1,4 @@
 "use client"
-import { CopilotChat } from "@copilotkit/react-ui";
 import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
 import { useEffect, useState, useRef } from "react";
 
@@ -422,6 +421,75 @@ export default function Page() {
     return `${BACKEND_BASE_URL.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
   };
 
+  const restoreAssetCardsFromLocalStorage = (): AssetCard[] => {
+    if (typeof window === "undefined") {
+      return [];
+    }
+    const raw = window.localStorage.getItem(ASSET_DOCK_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter((item): item is AssetCard => {
+        return Boolean(
+          item &&
+          typeof item.productName === "string" &&
+          typeof item.finalScript === "string" &&
+          typeof item.timestamp === "string" &&
+          typeof item.wavUrl === "string" &&
+          (typeof item.scriptUrl === "undefined" || typeof item.scriptUrl === "string")
+        );
+      })
+      .slice(0, 40);
+  };
+
+  const loadAssetsFromBackend = async (): Promise<AssetCard[]> => {
+    const response = await fetch(`${BACKEND_BASE_URL}/assets`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch assets: ${response.status}`);
+    }
+    const payload = await response.json() as {
+      audio?: BackendAudioAsset[];
+      scripts?: BackendScriptAsset[];
+    };
+
+    const audioItems = Array.isArray(payload.audio) ? payload.audio : [];
+    const scriptItems = Array.isArray(payload.scripts) ? payload.scripts : [];
+    const audioMap = new Map<string, BackendAudioAsset[]>();
+    for (const audio of audioItems) {
+      if (typeof audio.filename !== "string" || typeof audio.url !== "string") {
+        continue;
+      }
+      const match = /^sceneone_(.+)_[a-f0-9]{8}\.wav$/i.exec(audio.filename);
+      if (!match) {
+        continue;
+      }
+      const key = match[1];
+      const existing = audioMap.get(key) ?? [];
+      existing.push(audio);
+      audioMap.set(key, existing);
+    }
+
+    return scriptItems
+      .filter((script) => typeof script.product_name === "string" && typeof script.final_script === "string")
+      .map((script) => {
+        const key = safeProductKey(script.product_name);
+        const audio = (audioMap.get(key) ?? [])[0];
+        return {
+          productName: script.product_name,
+          finalScript: script.final_script,
+          timestamp: new Date(script.modified_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          wavUrl: audio ? absoluteBackendUrl(audio.url) : "",
+          scriptUrl: typeof script.url === "string" ? absoluteBackendUrl(script.url) : undefined,
+        };
+      })
+      .slice(0, 40);
+  };
+
   const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
     const parts = payload?.content?.parts;
     if (Array.isArray(parts)) {
@@ -714,7 +782,7 @@ export default function Page() {
     }
   }
 
-  function stopProduction() {
+  function stopProduction(syncAssets = true) {
     isSessionActiveRef.current = false;
     stopSpeechRecognition();
     stopMicStreaming();
@@ -736,6 +804,29 @@ export default function Page() {
       setElapsedSeconds(0);
       pushStatusLog("[SYSTEM]: Camera feed closed");
     }
+    if (!syncAssets) {
+      return;
+    }
+
+    void (async () => {
+      try {
+        const cards = await loadAssetsFromBackend();
+        if (cards.length > 0) {
+          setAssetCards(cards);
+          return;
+        }
+      } catch (error) {
+        console.error("Failed to sync assets after session end", error);
+      }
+      try {
+        const fallback = restoreAssetCardsFromLocalStorage();
+        if (fallback.length > 0) {
+          setAssetCards(fallback);
+        }
+      } catch (error) {
+        console.error("Failed to restore local asset fallback after session end", error);
+      }
+    })();
   }
 
   useCopilotReadable({
@@ -761,82 +852,9 @@ export default function Page() {
   useEffect(() => {
     let isCancelled = false;
 
-    const restoreFromLocalStorage = () => {
-      if (typeof window === "undefined") {
-        return;
-      }
-      try {
-        const raw = window.localStorage.getItem(ASSET_DOCK_STORAGE_KEY);
-        if (!raw) {
-          return;
-        }
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed)) {
-          return;
-        }
-        const restored = parsed
-          .filter((item): item is AssetCard => {
-            return Boolean(
-              item &&
-              typeof item.productName === "string" &&
-              typeof item.finalScript === "string" &&
-              typeof item.timestamp === "string" &&
-              typeof item.wavUrl === "string" &&
-              (typeof item.scriptUrl === "undefined" || typeof item.scriptUrl === "string")
-            );
-          })
-          .slice(0, 40);
-        if (restored.length > 0 && !isCancelled) {
-          setAssetCards(restored);
-        }
-      } catch (error) {
-        console.error("Failed to restore asset dock", error);
-      }
-    };
-
     const loadFromBackend = async () => {
       try {
-        const response = await fetch(`${BACKEND_BASE_URL}/assets`);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch assets: ${response.status}`);
-        }
-        const payload = await response.json() as {
-          audio?: BackendAudioAsset[];
-          scripts?: BackendScriptAsset[];
-        };
-
-        const audioItems = Array.isArray(payload.audio) ? payload.audio : [];
-        const scriptItems = Array.isArray(payload.scripts) ? payload.scripts : [];
-        const audioMap = new Map<string, BackendAudioAsset[]>();
-        for (const audio of audioItems) {
-          if (typeof audio.filename !== "string" || typeof audio.url !== "string") {
-            continue;
-          }
-          const match = /^sceneone_(.+)_[a-f0-9]{8}\.wav$/i.exec(audio.filename);
-          if (!match) {
-            continue;
-          }
-          const key = match[1];
-          const existing = audioMap.get(key) ?? [];
-          existing.push(audio);
-          audioMap.set(key, existing);
-        }
-
-        const cards: AssetCard[] = scriptItems
-          .filter((script) => typeof script.product_name === "string" && typeof script.final_script === "string")
-          .map((script) => {
-            const key = safeProductKey(script.product_name);
-            const audio = (audioMap.get(key) ?? [])[0];
-            return {
-              productName: script.product_name,
-              finalScript: script.final_script,
-              timestamp: new Date(script.modified_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-              wavUrl: audio ? absoluteBackendUrl(audio.url) : "",
-              scriptUrl: typeof script.url === "string" ? absoluteBackendUrl(script.url) : undefined,
-            };
-          })
-          .slice(0, 40);
-
+        const cards = await loadAssetsFromBackend();
         if (cards.length > 0 && !isCancelled) {
           setAssetCards(cards);
           return;
@@ -845,7 +863,14 @@ export default function Page() {
         console.error("Failed to load assets from backend", error);
       }
 
-      restoreFromLocalStorage();
+      try {
+        const fallback = restoreAssetCardsFromLocalStorage();
+        if (fallback.length > 0 && !isCancelled) {
+          setAssetCards(fallback);
+        }
+      } catch (error) {
+        console.error("Failed to restore asset dock", error);
+      }
     };
 
     void loadFromBackend();
@@ -875,11 +900,12 @@ export default function Page() {
   }, [isCameraActive]);
 
   useEffect(() => {
-    return () => stopProduction();
+    return () => stopProduction(false);
   }, []);
 
   const timerText = new Date(elapsedSeconds * 1000).toISOString().substring(11, 19);
   const personaMode = "HYPE-LINK";
+  const latestDirectorLine = liveFeedLogs.find((line) => line.startsWith("[DIRECTOR]:")) ?? "Awaiting director guidance";
 
   return (
     <main className="studio-shell min-h-screen px-4 py-6 md:px-8 md:py-8">
@@ -890,7 +916,7 @@ export default function Page() {
               Start Live Session
             </button>
           ) : (
-            <button onClick={stopProduction} className="studio-btn studio-btn-stop">
+            <button onClick={() => stopProduction()} className="studio-btn studio-btn-stop">
               End Live Session
             </button>
           )}
@@ -925,14 +951,40 @@ export default function Page() {
             </div>
           </article>
 
-          <aside className="obsidian-panel director-panel rounded-3xl lg:col-span-5">
-            <CopilotChat
-              instructions={"You are the SceneOneDirector. Analyse the video feed to help the user create an ad."}
-              labels={{
-                title: "Director's Monitor",
-                placeholder: "Wait, do you like the lighting?"
-              }}
-            />
+          <aside className="obsidian-panel director-panel rounded-3xl lg:col-span-5 p-4 md:p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="dock-title text-lg md:text-xl">Session Control</h2>
+              <span className="dock-subtitle">Live-only mode</span>
+            </div>
+            <div className="space-y-3">
+              <p className="dock-subtitle">Live status: {liveStatus}</p>
+              <p className="dock-subtitle">Speech status: {speechStatus}</p>
+              <p className="dock-subtitle">Persona: {personaMode}</p>
+              <p className="dock-subtitle">Latest director line:</p>
+              <p className="live-feed-line">{latestDirectorLine}</p>
+              <button
+                className="studio-btn studio-btn-secondary"
+                onClick={async () => {
+                  try {
+                    const cards = await loadAssetsFromBackend();
+                    if (cards.length > 0) {
+                      setAssetCards(cards);
+                      pushStatusLog("[SYSTEM]: Asset Dock synced from backend");
+                      return;
+                    }
+                  } catch (error) {
+                    console.error("Manual asset sync failed", error);
+                  }
+                  const fallback = restoreAssetCardsFromLocalStorage();
+                  if (fallback.length > 0) {
+                    setAssetCards(fallback);
+                    pushStatusLog("[SYSTEM]: Asset Dock loaded from local cache");
+                  }
+                }}
+              >
+                Sync Assets
+              </button>
+            </div>
           </aside>
         </section>
 
