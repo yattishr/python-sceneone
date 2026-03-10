@@ -36,6 +36,19 @@ from google.genai.errors import APIError
 load_dotenv()
 logger = logging.getLogger("sceneone.server")
 
+def _resolve_response_modality(modality: str):
+    """
+    Prefer enum modality objects when available to avoid pydantic serializer warnings.
+    Falls back to the raw string for older SDK variants.
+    """
+    modality_enum = getattr(types, "Modality", None)
+    if modality_enum is None:
+        return modality
+    try:
+        return modality_enum[modality]
+    except Exception:
+        return modality
+
 def _validate_llm_auth_config() -> None:
     has_api_key = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
     has_vertex_config = bool(os.getenv("GOOGLE_CLOUD_PROJECT") and os.getenv("GOOGLE_CLOUD_LOCATION"))
@@ -268,7 +281,7 @@ async def run_live(
 
     async def forward_events():
         run_config = RunConfig(
-            response_modalities=[modality],
+            response_modalities=[_resolve_response_modality(modality)],
             proactivity=(
                 types.ProactivityConfig(proactive_audio=proactive_audio)
                 if proactive_audio is not None
@@ -291,9 +304,18 @@ async def run_live(
                 )
             ) as agen:
                 async for event in agen:
-                    await websocket.send_text(
-                        event.model_dump_json(exclude_none=True, by_alias=True)
-                    )
+                    try:
+                        await websocket.send_text(
+                            event.model_dump_json(exclude_none=True, by_alias=True)
+                        )
+                    except WebSocketDisconnect:
+                        break
+                    except RuntimeError as exc:
+                        # Socket closed while model stream still yielded an event.
+                        if "websocket.send" in str(exc):
+                            logger.info("[run_live] websocket closed before event send")
+                            break
+                        raise
         except APIError as exc:
             logger.warning(
                 "[run_live] upstream APIError status=%s detail=%s",

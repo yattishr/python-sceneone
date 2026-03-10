@@ -63,6 +63,7 @@ const MAX_DIRECTOR_BUFFER_MS = 30_000;
 const TTS_WARMUP_MS = 800;
 const LIVE_RECONNECT_BASE_DELAY_MS = 1200;
 const LIVE_RECONNECT_MAX_ATTEMPTS = 6;
+const AUTO_END_AFTER_CAPTURE_MS = 1600;
 const durationToMs = (seconds: number): number => seconds * 1000;
 const isAllowedDurationSeconds = (value: number): value is AllowedDurationSeconds => (
   ALLOWED_DURATIONS_SECONDS.includes(value as AllowedDurationSeconds)
@@ -661,6 +662,15 @@ export default function Page() {
       ]);
       pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
       showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
+      if (source === "live" && isSessionActiveRef.current && !stopAfterCaptureRef.current) {
+        setIsStopQueued(true);
+        pushStatusLog("[SYSTEM]: Clip ready. Ending live session...");
+        setTimeout(() => {
+          if (isSessionActiveRef.current) {
+            stopProduction();
+          }
+        }, AUTO_END_AFTER_CAPTURE_MS);
+      }
     } catch (error) {
       isCaptureInProgressRef.current = false;
       setCaptureProgressLabel("");
