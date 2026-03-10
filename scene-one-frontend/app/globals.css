@@ -281,8 +281,58 @@ body {
   margin-top: 0.2rem;
 }
 
+.toast-stack {
+  pointer-events: none;
+  position: fixed;
+  right: 1rem;
+  top: 1rem;
+  z-index: 120;
+}
+
+.studio-toast {
+  animation: toastIn 180ms ease-out;
+  backdrop-filter: blur(10px);
+  border: 1px solid transparent;
+  border-radius: 0.85rem;
+  box-shadow: 0 14px 28px rgba(2, 6, 23, 0.45);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  max-width: min(92vw, 380px);
+  padding: 0.6rem 0.8rem;
+}
+
+.studio-toast-success {
+  background: rgba(15, 23, 42, 0.95);
+  border-color: rgba(173, 255, 47, 0.45);
+  color: #e2f8b7;
+}
+
+@keyframes toastIn {
+  0% {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @media (max-width: 768px) {
   .hud-logs {
     max-width: 95%;
+  }
+}
+
+@media (max-width: 640px) {
+  .toast-stack {
+    left: 0.75rem;
+    right: 0.75rem;
+    top: 0.75rem;
+  }
+
+  .studio-toast {
+    max-width: 100%;
   }
 }

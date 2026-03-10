@@ -85,12 +85,14 @@ export default function Page() {
   const directorPcmChunksRef = useRef<Uint8Array[]>([]);
   const directorPcmBytesRef = useRef(0);
   const directorSampleRateRef = useRef(DIRECTOR_DEFAULT_SAMPLE_RATE);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [visionLogs, setVisionLogs] = useState<string[]>(["[SYSTEM]: Awaiting live camera signal"]);
   const [liveFeedLogs, setLiveFeedLogs] = useState<string[]>([]);
   const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
+  const [toastMessage, setToastMessage] = useState("");
   const [selectedDurationSeconds, setSelectedDurationSeconds] = useState<AllowedDurationSeconds>(DEFAULT_DURATION_SECONDS);
   const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
   const [liveStatus, setLiveStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
@@ -101,6 +103,17 @@ export default function Page() {
 
   const pushLiveFeedLog = (message: string) => {
     setLiveFeedLogs((prev) => [message, ...prev].slice(0, 40));
+  };
+
+  const showToast = (message: string) => {
+    setToastMessage(message);
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = setTimeout(() => {
+      setToastMessage("");
+      toastTimerRef.current = null;
+    }, 3500);
   };
 
   const getSpeechRecognitionFactory = (): SpeechRecognitionFactory | null => {
@@ -620,6 +633,7 @@ export default function Page() {
         ...prev
       ]);
       pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
+      showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
     } catch (error) {
       isCaptureInProgressRef.current = false;
       console.error("Director capture failed", error);
@@ -935,12 +949,26 @@ export default function Page() {
     return () => stopProduction(false);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const timerText = new Date(elapsedSeconds * 1000).toISOString().substring(11, 19);
   const personaMode = "HYPE-LINK";
   const latestDirectorLine = liveFeedLogs.find((line) => line.startsWith("[DIRECTOR]:")) ?? "Awaiting director guidance";
 
   return (
     <main className="studio-shell min-h-screen px-4 py-6 md:px-8 md:py-8">
+      {toastMessage ? (
+        <div className="toast-stack" role="status" aria-live="polite">
+          <div className="studio-toast studio-toast-success">{toastMessage}</div>
+        </div>
+      ) : null}
       <div className="mx-auto flex w-full max-w-350 flex-col gap-6">
         <header className="studio-sticky-header flex flex-col items-start gap-3">
           {!isCameraActive ? (
