@@ -6,7 +6,13 @@ import os
 import shutil
 
 # Import the FastAPI app and the function to be tested
-from server import app, trim_and_clean_audio, EXPORT_DIR, TARGET_DURATION_MS
+from server import (
+    ALLOWED_TARGET_DURATION_SECONDS,
+    DEFAULT_TARGET_DURATION_SECONDS,
+    EXPORT_DIR,
+    app,
+    trim_and_clean_audio,
+)
 
 # Create a test client for the FastAPI app
 client = TestClient(app)
@@ -49,7 +55,7 @@ def test_trim_and_clean_audio_extends_short_audio_to_ten_seconds():
     assert os.path.exists(SHORT_AUDIO_PATH)
     processed_audio = trim_and_clean_audio(SHORT_AUDIO_PATH)
     assert isinstance(processed_audio, AudioSegment)
-    assert len(processed_audio) == TARGET_DURATION_MS
+    assert len(processed_audio) == DEFAULT_TARGET_DURATION_SECONDS * 1000
 
 def test_trim_and_clean_audio_cuts_long_audio_to_ten_seconds():
     """
@@ -58,31 +64,52 @@ def test_trim_and_clean_audio_cuts_long_audio_to_ten_seconds():
     assert os.path.exists(LONG_AUDIO_PATH)
     processed_audio = trim_and_clean_audio(LONG_AUDIO_PATH)
     assert isinstance(processed_audio, AudioSegment)
-    assert len(processed_audio) == TARGET_DURATION_MS
+    assert len(processed_audio) == DEFAULT_TARGET_DURATION_SECONDS * 1000
 
-def test_upload_ad_endpoint_returns_exact_ten_second_wav():
+def test_upload_ad_endpoint_returns_exact_requested_wav_duration():
     """
-    Upload endpoint should return a downloadable WAV file at exact target duration.
+    Upload endpoint should return a downloadable WAV file at exact requested duration.
     """
     assert os.path.exists(SHORT_AUDIO_PATH)
+    duration_seconds = 20
 
     with open(SHORT_AUDIO_PATH, "rb") as f:
         response = client.post(
             "/upload-ad",
-            files={"file": ("dummy_short_audio.wav", f, "audio/wav")}
+            files={"file": ("dummy_short_audio.wav", f, "audio/wav")},
+            data={"duration_seconds": str(duration_seconds)},
         )
 
     assert response.status_code == 200
     response_json = response.json()
     assert response_json["status"] == "success"
-    assert response_json["duration_ms"] == TARGET_DURATION_MS
+    assert response_json["duration_seconds"] == duration_seconds
+    assert response_json["duration_ms"] == duration_seconds * 1000
     assert "download_url" in response_json
 
     filename = response_json["download_url"].rsplit("/", 1)[-1]
     exported_file_path = os.path.join(EXPORT_DIR, filename)
     assert os.path.exists(exported_file_path)
     exported_audio = AudioSegment.from_wav(exported_file_path)
-    assert len(exported_audio) == TARGET_DURATION_MS
+    assert len(exported_audio) == duration_seconds * 1000
 
     if os.path.exists(exported_file_path):
         os.remove(exported_file_path)
+
+def test_upload_ad_endpoint_rejects_invalid_duration():
+    """
+    Upload endpoint should reject durations outside the allowed set.
+    """
+    assert os.path.exists(SHORT_AUDIO_PATH)
+    invalid_duration = max(ALLOWED_TARGET_DURATION_SECONDS) + 5
+
+    with open(SHORT_AUDIO_PATH, "rb") as f:
+        response = client.post(
+            "/upload-ad",
+            files={"file": ("dummy_short_audio.wav", f, "audio/wav")},
+            data={"duration_seconds": str(invalid_duration)},
+        )
+
+    assert response.status_code == 400
+    response_json = response.json()
+    assert "Invalid duration_seconds" in response_json["detail"]

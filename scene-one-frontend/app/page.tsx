@@ -6,6 +6,7 @@ type AssetCard = {
   productName: string;
   finalScript: string;
   timestamp: string;
+  durationSeconds: number;
   wavUrl: string;
   scriptUrl?: string;
 };
@@ -25,6 +26,7 @@ type SpeechRecognitionFactory = new () => BrowserSpeechRecognition;
 type CaptureRequest = {
   product_name?: string;
   final_script?: string;
+  duration_seconds?: number;
 };
 type BackendAudioAsset = {
   filename: string;
@@ -36,6 +38,7 @@ type BackendScriptAsset = {
   filename: string;
   url: string;
   product_name: string;
+  duration_seconds?: number;
   final_script: string;
   modified_at: string;
   size_bytes: number;
@@ -46,7 +49,9 @@ const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhos
 const LIVE_APP_NAME = process.env.NEXT_PUBLIC_ADK_LIVE_APP_NAME ?? "scene_one_agent";
 const LIVE_USER_ID = process.env.NEXT_PUBLIC_ADK_LIVE_USER_ID ?? "studio_user_01";
 const LIVE_RESPONSE_MODALITY = process.env.NEXT_PUBLIC_ADK_LIVE_MODALITY ?? "AUDIO";
-const RECORDING_DURATION_MS = 10_000;
+const ALLOWED_DURATIONS_SECONDS = [10, 20, 30] as const;
+type AllowedDurationSeconds = (typeof ALLOWED_DURATIONS_SECONDS)[number];
+const DEFAULT_DURATION_SECONDS: AllowedDurationSeconds = 10;
 const SPEECH_SEND_COOLDOWN_MS = 1200;
 const LIVE_INPUT_SAMPLE_RATE = 16000;
 const FRAME_STREAM_INTERVAL_MS = 1200;
@@ -56,6 +61,10 @@ const DIRECTOR_AUDIO_CHANNELS = 1;
 const PCM16_BYTES_PER_SAMPLE = 2;
 const MAX_DIRECTOR_BUFFER_MS = 30_000;
 const TTS_WARMUP_MS = 800;
+const durationToMs = (seconds: number): number => seconds * 1000;
+const isAllowedDurationSeconds = (value: number): value is AllowedDurationSeconds => (
+  ALLOWED_DURATIONS_SECONDS.includes(value as AllowedDurationSeconds)
+);
 
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -82,6 +91,7 @@ export default function Page() {
   const [visionLogs, setVisionLogs] = useState<string[]>(["[SYSTEM]: Awaiting live camera signal"]);
   const [liveFeedLogs, setLiveFeedLogs] = useState<string[]>([]);
   const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
+  const [selectedDurationSeconds, setSelectedDurationSeconds] = useState<AllowedDurationSeconds>(DEFAULT_DURATION_SECONDS);
   const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
   const [liveStatus, setLiveStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
 
@@ -404,9 +414,18 @@ export default function Page() {
     const candidate = value as Record<string, unknown>;
     const productName = candidate.product_name;
     const finalScript = candidate.final_script;
+    const durationRaw = candidate.duration_seconds;
+    const durationValue = typeof durationRaw === "number"
+      ? durationRaw
+      : typeof durationRaw === "string"
+        ? Number(durationRaw)
+        : undefined;
     return {
       product_name: typeof productName === "string" ? productName : undefined,
       final_script: typeof finalScript === "string" ? finalScript : undefined,
+      duration_seconds: typeof durationValue === "number" && Number.isFinite(durationValue)
+        ? durationValue
+        : undefined,
     };
   };
 
@@ -440,6 +459,8 @@ export default function Page() {
           typeof item.productName === "string" &&
           typeof item.finalScript === "string" &&
           typeof item.timestamp === "string" &&
+          typeof item.durationSeconds === "number" &&
+          isAllowedDurationSeconds(item.durationSeconds) &&
           typeof item.wavUrl === "string" &&
           (typeof item.scriptUrl === "undefined" || typeof item.scriptUrl === "string")
         );
@@ -479,10 +500,14 @@ export default function Page() {
       .map((script) => {
         const key = safeProductKey(script.product_name);
         const audio = (audioMap.get(key) ?? [])[0];
+        const durationSeconds = isAllowedDurationSeconds(Number(script.duration_seconds))
+          ? Number(script.duration_seconds)
+          : DEFAULT_DURATION_SECONDS;
         return {
           productName: script.product_name,
           finalScript: script.final_script,
           timestamp: new Date(script.modified_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+          durationSeconds,
           wavUrl: audio ? absoluteBackendUrl(audio.url) : "",
           scriptUrl: typeof script.url === "string" ? absoluteBackendUrl(script.url) : undefined,
         };
@@ -521,14 +546,18 @@ export default function Page() {
 
     const productName = (request.product_name || "untitled").trim() || "untitled";
     const finalScript = (request.final_script || lastDirectorTextRef.current || "No script text.").trim();
-    const captureKey = `${productName}::${finalScript}`;
+    const durationSeconds = isAllowedDurationSeconds(Number(request.duration_seconds))
+      ? Number(request.duration_seconds)
+      : selectedDurationSeconds;
+    const recordingDurationMs = durationToMs(durationSeconds);
+    const captureKey = `${productName}::${durationSeconds}::${finalScript}`;
     if (captureKey === lastCaptureKeyRef.current) {
       return;
     }
 
     isCaptureInProgressRef.current = true;
     lastCaptureKeyRef.current = captureKey;
-    pushStatusLog(`🎬 [ACTION]: Rendering script voiceover (${source})...`);
+    pushStatusLog(`🎬 [ACTION]: Rendering ${durationSeconds}s script voiceover (${source})...`);
 
     try {
       if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
@@ -538,13 +567,13 @@ export default function Page() {
       directorPcmChunksRef.current = [];
       directorPcmBytesRef.current = 0;
       await sendDirectorMessage(
-        `Read this ad script verbatim with no intro or outro. Output only the script as spoken audio:\n${finalScript}`
+        `Read this ad script verbatim with no intro or outro. Keep pacing aligned to exactly ${durationSeconds} seconds. Output only the script as spoken audio:\n${finalScript}`
       );
-      await new Promise((resolve) => setTimeout(resolve, RECORDING_DURATION_MS + TTS_WARMUP_MS));
+      await new Promise((resolve) => setTimeout(resolve, recordingDurationMs + TTS_WARMUP_MS));
 
       const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
       const wantedBytes = Math.floor(
-        (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * RECORDING_DURATION_MS) / 1000
+        (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * recordingDurationMs) / 1000
       );
       const recentPcm = getRecentDirectorPcm(wantedBytes);
       if (recentPcm.length < sampleRate * PCM16_BYTES_PER_SAMPLE) {
@@ -555,6 +584,7 @@ export default function Page() {
       const safeName = productName.replace(/\s+/g, "_").toLowerCase();
       const formData = new FormData();
       formData.append("file", wavBlob, `${safeName}.wav`);
+      formData.append("duration_seconds", String(durationSeconds));
 
       const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
         method: "POST",
@@ -584,6 +614,7 @@ export default function Page() {
           productName,
           finalScript,
           timestamp: time,
+          durationSeconds,
           wavUrl: data.download_url
         },
         ...prev
@@ -774,7 +805,7 @@ export default function Page() {
       startSpeechRecognition();
       await sendFrameToDirector();
       await sendDirectorMessage(
-        "Live session started. I am showing a product on camera. React as director in real time and ask clarifying questions if needed.",
+        `Live session started. I am showing a product on camera. React as director in real time and ask clarifying questions if needed. Current target ad length is ${selectedDurationSeconds} seconds.`,
       );
     } catch (err) {
       console.error("Failed to start production", err);
@@ -839,13 +870,14 @@ export default function Page() {
   //useCoPilotAction: Alerts the UI that a script and audio recording are ready.
   useCopilotAction({
     name: "capture_ad_script",
-    description: "Alerts the UI that a script is ready and triggers a 10-second audio capture.",
+    description: "Alerts the UI that a script is ready and triggers a duration-based audio capture.",
     parameters: [
       { name: "product_name", type: "string" },
-      { name: "final_script", type: "string" }
+      { name: "final_script", type: "string" },
+      { name: "duration_seconds", type: "number" }
     ],
-    handler: async ({ product_name, final_script }) => {
-      await captureAndUploadAudio({ product_name, final_script }, "copilot");
+    handler: async ({ product_name, final_script, duration_seconds }) => {
+      await captureAndUploadAudio({ product_name, final_script, duration_seconds }, "copilot");
     }
   });
 
@@ -960,6 +992,26 @@ export default function Page() {
               <p className="dock-subtitle">Live status: {liveStatus}</p>
               <p className="dock-subtitle">Speech status: {speechStatus}</p>
               <p className="dock-subtitle">Persona: {personaMode}</p>
+              <label className="dock-subtitle" htmlFor="duration-select">
+                Target audio length:
+              </label>
+              <select
+                id="duration-select"
+                className="studio-btn studio-select w-full"
+                value={selectedDurationSeconds}
+                onChange={(event) => {
+                  const nextValue = Number(event.target.value);
+                  if (isAllowedDurationSeconds(nextValue)) {
+                    setSelectedDurationSeconds(nextValue);
+                  }
+                }}
+              >
+                {ALLOWED_DURATIONS_SECONDS.map((duration) => (
+                  <option key={duration} value={duration}>
+                    {duration} seconds
+                  </option>
+                ))}
+              </select>
               <p className="dock-subtitle">Latest director line:</p>
               <p className="live-feed-line">{latestDirectorLine}</p>
               <button
@@ -1022,7 +1074,7 @@ export default function Page() {
               assetCards.map((asset) => (
                 <div key={`${asset.productName}-${asset.timestamp}`} className="asset-card">
                   <p className="asset-name">{asset.productName}</p>
-                  <p className="asset-time">{asset.timestamp}</p>
+                  <p className="asset-time">{asset.timestamp} · {asset.durationSeconds}s</p>
                   <div className="mt-4 flex gap-2">
                     {asset.wavUrl ? (
                       <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>

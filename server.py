@@ -10,7 +10,7 @@ from contextlib import aclosing
 from typing import Literal
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, WebSocket, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
@@ -88,7 +88,9 @@ EXPORT_DIR = "exports/audio"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 SCRIPT_DIR = "exports/scripts"
 os.makedirs(SCRIPT_DIR, exist_ok=True)
-TARGET_DURATION_MS = 10_000
+DEFAULT_TARGET_DURATION_SECONDS = 10
+ALLOWED_TARGET_DURATION_SECONDS = {10, 20, 30}
+TARGET_DURATION_MS = DEFAULT_TARGET_DURATION_SECONDS * 1000
 SILENCE_THRESHOLD_DBFS = -40
 TRIM_PADDING_MS = 100
 FADE_MS = 50
@@ -106,6 +108,15 @@ def _safe_stem(filename: str) -> str:
     stem = Path(filename).stem or "untitled"
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("_")
     return cleaned or "untitled"
+
+def _validate_duration_seconds(duration_seconds: int) -> int:
+    if duration_seconds not in ALLOWED_TARGET_DURATION_SECONDS:
+        allowed = ", ".join(str(value) for value in sorted(ALLOWED_TARGET_DURATION_SECONDS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid duration_seconds={duration_seconds}. Allowed values: {allowed}.",
+        )
+    return duration_seconds
 
 def _enforce_exact_duration(audio: AudioSegment, target_duration_ms: int) -> AudioSegment:
     if len(audio) > target_duration_ms:
@@ -166,8 +177,17 @@ def _parse_script_file(path: Path) -> dict:
     lines = content.splitlines()
     product_name = "Untitled Product"
     final_script = content.strip()
+    duration_seconds = DEFAULT_TARGET_DURATION_SECONDS
     if lines and lines[0].startswith("PRODUCT:"):
         product_name = lines[0].split(":", 1)[1].strip() or product_name
+    for line in lines:
+        if line.startswith("DURATION_SECONDS:"):
+            raw_duration = line.split(":", 1)[1].strip()
+            if raw_duration.isdigit():
+                parsed_duration = int(raw_duration)
+                if parsed_duration in ALLOWED_TARGET_DURATION_SECONDS:
+                    duration_seconds = parsed_duration
+            break
     marker = "--- SCRIPT ---"
     marker_index = content.find(marker)
     if marker_index >= 0:
@@ -176,6 +196,7 @@ def _parse_script_file(path: Path) -> dict:
         "filename": path.name,
         "url": f"/scripts/{path.name}",
         "product_name": product_name,
+        "duration_seconds": duration_seconds,
         "final_script": final_script,
         "modified_at": _iso_utc(path.stat().st_mtime),
         "size_bytes": path.stat().st_size,
@@ -292,7 +313,11 @@ async def run_live(
             task.cancel()
 
 @app.post("/upload-ad")
-async def upload_ad(request: Request, file: UploadFile = File(...)):
+async def upload_ad(
+    request: Request,
+    file: UploadFile = File(...),
+    duration_seconds: int = Form(default=DEFAULT_TARGET_DURATION_SECONDS),
+):
     print(
         f"[upload-ad] received file='{file.filename}' "
         f"content_type='{file.content_type}'"
@@ -302,6 +327,8 @@ async def upload_ad(request: Request, file: UploadFile = File(...)):
     if file.content_type and not file.content_type.startswith("audio/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be audio.")
 
+    duration_seconds = _validate_duration_seconds(duration_seconds)
+    target_duration_ms = duration_seconds * 1000
     safe_name = _safe_stem(file.filename)
     temp_suffix = Path(file.filename).suffix or ".bin"
     temp_path = Path(f"temp_{uuid.uuid4().hex}{temp_suffix}")
@@ -330,7 +357,7 @@ async def upload_ad(request: Request, file: UploadFile = File(...)):
         if temp_size == 0:
             raise ValueError("Uploaded audio is empty (0 bytes).")
 
-        processed_audio = trim_and_clean_audio(str(temp_path))
+        processed_audio = trim_and_clean_audio(str(temp_path), target_duration_ms=target_duration_ms)
         processed_audio.export(str(final_path), format="wav")
     except CouldntDecodeError as exc:
         logger.exception("[upload-ad] could not decode audio file")
@@ -352,6 +379,7 @@ async def upload_ad(request: Request, file: UploadFile = File(...)):
     return {
         "status": "success",
         "duration_ms": len(processed_audio),
+        "duration_seconds": duration_seconds,
         "download_url": f"{str(request.base_url).rstrip('/')}/download/{final_filename}",
     }
 

@@ -97,6 +97,26 @@ body {
   color: #fde68a;
 }
 
+.studio-select {
+  background: rgba(15, 23, 42, 0.92);
+  border-color: rgba(148, 163, 184, 0.55);
+  color: #f8fafc;
+  -webkit-text-fill-color: #f8fafc;
+}
+
+.studio-select:hover,
+.studio-select:focus {
+  background: rgba(15, 23, 42, 0.96);
+  border-color: rgba(173, 255, 47, 0.6);
+  color: #f8fafc;
+  outline: none;
+}
+
+.studio-select option {
+  background: #0f172a;
+  color: #f8fafc;
+}
+
 .hud-overlay {
   pointer-events: none;
   position: absolute;

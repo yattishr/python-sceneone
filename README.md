@@ -8,9 +8,9 @@ SceneOne is a live ad-production app with:
 ## Recording Loop
 
 When the agent calls `capture_ad_script`:
-1. Frontend records microphone audio for 10 seconds.
+1. Frontend records microphone audio for the selected duration (`10`, `20`, or `30` seconds).
 2. Frontend uploads the recorded file to `POST /upload-ad`.
-3. Backend trims silence, normalizes, applies fades, then enforces exact 10,000 ms output.
+3. Backend trims silence, normalizes, applies fades, then enforces exact output length based on the selected duration.
 4. Backend exports a WAV to `exports/audio` and returns a downloadable URL.
 
 ## Requirements
