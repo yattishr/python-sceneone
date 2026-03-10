@@ -3,8 +3,8 @@ import re
 import shutil
 import uuid
 import asyncio
-import traceback
 import logging
+import json
 from pathlib import Path
 from contextlib import aclosing
 from typing import Literal
@@ -29,6 +29,7 @@ from google.adk import Runner
 from google.adk.agents import RunConfig
 from google.adk.agents.live_request_queue import LiveRequestQueue, LiveRequest
 from google.genai import types
+from google.genai.errors import APIError
 
 # Align env-loading behavior with `adk web .` so direct `server.py` runs
 # can resolve Gemini credentials from the project .env file.
@@ -256,6 +257,15 @@ async def run_live(
     await websocket.accept()
     live_request_queue = LiveRequestQueue()
 
+    async def _send_error_payload(error_code: str, detail: str):
+        try:
+            await websocket.send_text(
+                json.dumps({"error": error_code, "detail": detail})
+            )
+        except Exception:
+            # Best effort: the socket may already be closed.
+            pass
+
     async def forward_events():
         run_config = RunConfig(
             response_modalities=[modality],
@@ -271,18 +281,32 @@ async def run_live(
                 else None
             ),
         )
-        async with aclosing(
-            live_runner.run_live(
-                user_id=user_id,
-                session_id=session_id,
-                live_request_queue=live_request_queue,
-                run_config=run_config,
-            )
-        ) as agen:
-            async for event in agen:
-                await websocket.send_text(
-                    event.model_dump_json(exclude_none=True, by_alias=True)
+        try:
+            async with aclosing(
+                live_runner.run_live(
+                    user_id=user_id,
+                    session_id=session_id,
+                    live_request_queue=live_request_queue,
+                    run_config=run_config,
                 )
+            ) as agen:
+                async for event in agen:
+                    await websocket.send_text(
+                        event.model_dump_json(exclude_none=True, by_alias=True)
+                    )
+        except APIError as exc:
+            logger.warning(
+                "[run_live] upstream APIError status=%s detail=%s",
+                getattr(exc, "status_code", "unknown"),
+                str(exc),
+            )
+            await _send_error_payload(
+                "UPSTREAM_LIVE_ERROR",
+                "Live model connection interrupted. Reconnecting...",
+            )
+            raise
+        except WebSocketDisconnect:
+            pass
 
     async def process_messages():
         try:
@@ -294,6 +318,8 @@ async def run_live(
             await websocket.send_text(
                 '{"error":"Invalid live request payload; expected LiveRequest JSON."}'
             )
+        except WebSocketDisconnect:
+            pass
 
     tasks = [
         asyncio.create_task(forward_events()),
@@ -305,9 +331,18 @@ async def run_live(
             task.result()
     except WebSocketDisconnect:
         pass
+    except APIError as exc:
+        logger.warning("[run_live] closing websocket after upstream APIError: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="Upstream live error")
+        except Exception:
+            pass
     except Exception as exc:
-        traceback.print_exc()
-        await websocket.close(code=1011, reason=str(exc)[:123])
+        logger.exception("[run_live] unexpected websocket error")
+        try:
+            await websocket.close(code=1011, reason=str(exc)[:123])
+        except Exception:
+            pass
     finally:
         for task in pending:
             task.cancel()

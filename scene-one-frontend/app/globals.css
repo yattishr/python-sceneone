@@ -73,6 +73,12 @@ body {
   transform: translateY(-1px);
 }
 
+.studio-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+  transform: none;
+}
+
 .studio-btn-start {
   background: rgba(173, 255, 47, 0.15);
   border-color: rgba(173, 255, 47, 0.5);
@@ -222,6 +228,28 @@ body {
   font-size: 0.76rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.capture-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.capture-progress-track {
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+  height: 0.56rem;
+  overflow: hidden;
+  width: 100%;
+}
+
+.capture-progress-fill {
+  background: linear-gradient(90deg, rgba(173, 255, 47, 0.75), rgba(59, 130, 246, 0.9));
+  border-radius: 9999px;
+  height: 100%;
+  transition: width 260ms ease;
 }
 
 .asset-scroll {

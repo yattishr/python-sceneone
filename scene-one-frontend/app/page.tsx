@@ -61,6 +61,8 @@ const DIRECTOR_AUDIO_CHANNELS = 1;
 const PCM16_BYTES_PER_SAMPLE = 2;
 const MAX_DIRECTOR_BUFFER_MS = 30_000;
 const TTS_WARMUP_MS = 800;
+const LIVE_RECONNECT_BASE_DELAY_MS = 1200;
+const LIVE_RECONNECT_MAX_ATTEMPTS = 6;
 const durationToMs = (seconds: number): number => seconds * 1000;
 const isAllowedDurationSeconds = (value: number): value is AllowedDurationSeconds => (
   ALLOWED_DURATIONS_SECONDS.includes(value as AllowedDurationSeconds)
@@ -86,6 +88,11 @@ export default function Page() {
   const directorPcmBytesRef = useRef(0);
   const directorSampleRateRef = useRef(DIRECTOR_DEFAULT_SAMPLE_RATE);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopAfterCaptureRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectInFlightRef = useRef(false);
+  const intentionalSocketCloseRef = useRef(false);
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -93,6 +100,9 @@ export default function Page() {
   const [liveFeedLogs, setLiveFeedLogs] = useState<string[]>([]);
   const [assetCards, setAssetCards] = useState<AssetCard[]>([]);
   const [toastMessage, setToastMessage] = useState("");
+  const [captureProgressLabel, setCaptureProgressLabel] = useState("");
+  const [captureProgressPercent, setCaptureProgressPercent] = useState(0);
+  const [isStopQueued, setIsStopQueued] = useState(false);
   const [selectedDurationSeconds, setSelectedDurationSeconds] = useState<AllowedDurationSeconds>(DEFAULT_DURATION_SECONDS);
   const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
   const [liveStatus, setLiveStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
@@ -114,6 +124,18 @@ export default function Page() {
       setToastMessage("");
       toastTimerRef.current = null;
     }, 3500);
+  };
+
+  const updateCaptureProgress = (label: string, percent: number) => {
+    setCaptureProgressLabel(label);
+    setCaptureProgressPercent(Math.max(0, Math.min(100, percent)));
+  };
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
   };
 
   const getSpeechRecognitionFactory = (): SpeechRecognitionFactory | null => {
@@ -570,6 +592,7 @@ export default function Page() {
 
     isCaptureInProgressRef.current = true;
     lastCaptureKeyRef.current = captureKey;
+    updateCaptureProgress(`Preparing ${durationSeconds}s clip...`, 10);
     pushStatusLog(`🎬 [ACTION]: Rendering ${durationSeconds}s script voiceover (${source})...`);
 
     try {
@@ -579,12 +602,14 @@ export default function Page() {
 
       directorPcmChunksRef.current = [];
       directorPcmBytesRef.current = 0;
+      updateCaptureProgress("Rendering script voiceover...", 30);
       await sendDirectorMessage(
         `Read this ad script verbatim with no intro or outro. Keep pacing aligned to exactly ${durationSeconds} seconds. Output only the script as spoken audio:\n${finalScript}`
       );
       await new Promise((resolve) => setTimeout(resolve, recordingDurationMs + TTS_WARMUP_MS));
 
       const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
+      updateCaptureProgress("Assembling captured audio...", 60);
       const wantedBytes = Math.floor(
         (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * recordingDurationMs) / 1000
       );
@@ -598,6 +623,7 @@ export default function Page() {
       const formData = new FormData();
       formData.append("file", wavBlob, `${safeName}.wav`);
       formData.append("duration_seconds", String(durationSeconds));
+      updateCaptureProgress("Uploading clip for WAV finalization...", 80);
 
       const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
         method: "POST",
@@ -620,6 +646,7 @@ export default function Page() {
       if (!data.download_url) {
         throw new Error("Upload succeeded but no download URL returned.");
       }
+      updateCaptureProgress("Finalizing clip...", 100);
 
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       setAssetCards((prev) => [
@@ -636,13 +663,29 @@ export default function Page() {
       showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
     } catch (error) {
       isCaptureInProgressRef.current = false;
+      setCaptureProgressLabel("");
+      setCaptureProgressPercent(0);
       console.error("Director capture failed", error);
       const message = error instanceof Error ? error.message : "Director audio export failed";
       pushStatusLog(`[ERROR]: ${message}`);
+      if (stopAfterCaptureRef.current) {
+        stopAfterCaptureRef.current = false;
+        setIsStopQueued(false);
+        stopProduction();
+      }
       return;
     }
 
     isCaptureInProgressRef.current = false;
+    setTimeout(() => {
+      setCaptureProgressLabel("");
+      setCaptureProgressPercent(0);
+    }, 900);
+    if (stopAfterCaptureRef.current) {
+      stopAfterCaptureRef.current = false;
+      setIsStopQueued(false);
+      stopProduction();
+    }
   };
 
   const getLiveSocketUrl = (sessionId: string) => {
@@ -659,7 +702,13 @@ export default function Page() {
     return `${wsBase}/run_live?${params.toString()}`;
   };
 
-  const closeLiveSocket = () => {
+  const closeLiveSocket = (intentional = true) => {
+    if (intentional) {
+      intentionalSocketCloseRef.current = true;
+    }
+    clearReconnectTimer();
+    reconnectAttemptsRef.current = 0;
+    reconnectInFlightRef.current = false;
     if (liveSocketRef.current) {
       liveSocketRef.current.close();
       liveSocketRef.current = null;
@@ -667,7 +716,8 @@ export default function Page() {
     setLiveStatus("disconnected");
   };
 
-  const connectLiveSocket = async () => {
+  const connectLiveSocket = async (isReconnect = false) => {
+    intentionalSocketCloseRef.current = false;
     const sessionId = crypto.randomUUID();
     const wsUrl = getLiveSocketUrl(sessionId);
     setLiveStatus("connecting");
@@ -678,7 +728,9 @@ export default function Page() {
 
       socket.onopen = () => {
         setLiveStatus("connected");
-        pushStatusLog("[SYSTEM]: Live agent channel connected");
+        if (!isReconnect) {
+          pushStatusLog("[SYSTEM]: Live agent channel connected");
+        }
         resolve();
       };
 
@@ -688,13 +740,23 @@ export default function Page() {
         reject(new Error("Live WebSocket connection failed."));
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event) => {
+        liveSocketRef.current = null;
         setLiveStatus("disconnected");
+        if (intentionalSocketCloseRef.current || !isSessionActiveRef.current) {
+          return;
+        }
+        scheduleLiveReconnect(event.reason || `code ${event.code}`);
       };
 
       socket.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
+          if (payload?.error) {
+            const detail = typeof payload.detail === "string" ? payload.detail : "Live upstream error";
+            pushStatusLog(`[WARN]: ${detail}`);
+            return;
+          }
           const parts = payload?.content?.parts;
           if (Array.isArray(parts)) {
             for (const part of parts) {
@@ -725,6 +787,50 @@ export default function Page() {
         }
       };
     });
+  };
+
+  const scheduleLiveReconnect = (reason: string) => {
+    if (!isSessionActiveRef.current) {
+      return;
+    }
+    if (reconnectInFlightRef.current || reconnectTimerRef.current) {
+      return;
+    }
+    if (reconnectAttemptsRef.current >= LIVE_RECONNECT_MAX_ATTEMPTS) {
+      pushStatusLog("[ERROR]: Live agent disconnected. Restart session to continue.");
+      showToast("Live connection dropped. Please restart the session.");
+      return;
+    }
+
+    reconnectAttemptsRef.current += 1;
+    const attempt = reconnectAttemptsRef.current;
+    const delayMs = Math.min(LIVE_RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), 10_000);
+    pushStatusLog(
+      `[WARN]: Live connection lost (${reason}). Reconnecting in ${Math.ceil(delayMs / 1000)}s (${attempt}/${LIVE_RECONNECT_MAX_ATTEMPTS})...`
+    );
+
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (!isSessionActiveRef.current) {
+        return;
+      }
+      reconnectInFlightRef.current = true;
+      void (async () => {
+        try {
+          await connectLiveSocket(true);
+          reconnectAttemptsRef.current = 0;
+          pushStatusLog("[SYSTEM]: Live agent channel reconnected");
+          await sendDirectorMessage(
+            `Live session resumed after reconnect. Continue directing from the current camera feed. Target ad length is ${selectedDurationSeconds} seconds.`,
+          );
+        } catch (error) {
+          console.error("Live reconnect failed", error);
+          scheduleLiveReconnect("retry failure");
+        } finally {
+          reconnectInFlightRef.current = false;
+        }
+      })();
+    }, delayMs);
   };
 
   const stopSpeechRecognition = () => {
@@ -814,6 +920,7 @@ export default function Page() {
       }
 
       await connectLiveSocket();
+      reconnectAttemptsRef.current = 0;
       await startMicStreaming(stream);
       startFrameStreaming();
       startSpeechRecognition();
@@ -823,7 +930,7 @@ export default function Page() {
       );
     } catch (err) {
       console.error("Failed to start production", err);
-      pushStatusLog("[ERROR]: Camera permission denied or unavailable");
+      pushStatusLog("[ERROR]: Could not start live session");
     }
   }
 
@@ -832,10 +939,11 @@ export default function Page() {
     stopSpeechRecognition();
     stopMicStreaming();
     stopFrameStreaming();
-    closeLiveSocket();
+    closeLiveSocket(true);
     directorPcmChunksRef.current = [];
     directorPcmBytesRef.current = 0;
     directorSampleRateRef.current = DIRECTOR_DEFAULT_SAMPLE_RATE;
+    setIsStopQueued(false);
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -873,6 +981,16 @@ export default function Page() {
       }
     })();
   }
+
+  const requestStopProduction = () => {
+    if (isCaptureInProgressRef.current) {
+      stopAfterCaptureRef.current = true;
+      setIsStopQueued(true);
+      pushStatusLog("[SYSTEM]: Finishing current clip before ending session...");
+      return;
+    }
+    stopProduction();
+  };
 
   useCopilotReadable({
     description: "The current visual state of the production studio",
@@ -951,6 +1069,7 @@ export default function Page() {
 
   useEffect(() => {
     return () => {
+      clearReconnectTimer();
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
         toastTimerRef.current = null;
@@ -976,8 +1095,12 @@ export default function Page() {
               Start Live Session
             </button>
           ) : (
-            <button onClick={() => stopProduction()} className="studio-btn studio-btn-stop">
-              End Live Session
+            <button
+              onClick={requestStopProduction}
+              className="studio-btn studio-btn-stop"
+              disabled={isStopQueued}
+            >
+              {isStopQueued ? "Finishing Clip..." : "End Live Session"}
             </button>
           )}
           <h1 className="studio-title text-3xl md:text-4xl">SceneOne Studio</h1>
@@ -1020,6 +1143,14 @@ export default function Page() {
               <p className="dock-subtitle">Live status: {liveStatus}</p>
               <p className="dock-subtitle">Speech status: {speechStatus}</p>
               <p className="dock-subtitle">Persona: {personaMode}</p>
+              {captureProgressLabel ? (
+                <div className="capture-progress-wrap">
+                  <p className="dock-subtitle">{captureProgressLabel}</p>
+                  <div className="capture-progress-track" aria-hidden>
+                    <div className="capture-progress-fill" style={{ width: `${captureProgressPercent}%` }} />
+                  </div>
+                </div>
+              ) : null}
               <label className="dock-subtitle" htmlFor="duration-select">
                 Target audio length:
               </label>
@@ -1110,7 +1241,7 @@ export default function Page() {
                       </a>
                     ) : (
                       <button className="studio-btn studio-btn-secondary" disabled>
-                        WAV pending
+                        {captureProgressLabel ? "WAV generating..." : "WAV pending"}
                       </button>
                     )}
                     {asset.scriptUrl ? (
