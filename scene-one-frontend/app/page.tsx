@@ -514,6 +514,10 @@ export default function Page() {
     return filename.replace(/\.[^.]+$/, "");
   };
 
+  const buildScriptDocument = (productName: string, durationSeconds: number, finalScript: string): string => {
+    return `PRODUCT: ${productName}\nDURATION_SECONDS: ${durationSeconds}\n--- SCRIPT ---\n${finalScript}`.trim();
+  };
+
   const absoluteBackendUrl = (path: string): string => {
     if (/^https?:\/\//i.test(path)) {
       return path;
@@ -718,6 +722,55 @@ export default function Page() {
       }
       updateCaptureProgress("Finalizing clip...", 100);
 
+      let resolvedWavUrl = absoluteBackendUrl(String(data.download_url));
+      let resolvedScriptUrl: string | undefined;
+      try {
+        const finalWavResponse = await fetch(resolvedWavUrl);
+        if (!finalWavResponse.ok) {
+          throw new Error(`Failed to fetch finalized WAV: ${finalWavResponse.status}`);
+        }
+        const finalWavBlob = await finalWavResponse.blob();
+        const objectName = decodeURIComponent(
+          String(data.download_url).split("/").pop() || `${safeName}_${Date.now()}.wav`
+        );
+        const scriptId = objectName.replace(/\.[^.]+$/, "");
+
+        const audioFormData = new FormData();
+        audioFormData.append("file", finalWavBlob, objectName);
+        audioFormData.append("object_name", objectName);
+
+        const scriptFormData = new FormData();
+        scriptFormData.append("script_id", scriptId);
+        scriptFormData.append(
+          "script_text",
+          buildScriptDocument(productName, durationSeconds, finalScript)
+        );
+
+        const [audioSyncResponse, scriptSyncResponse] = await Promise.all([
+          fetch(`${BACKEND_BASE_URL}/gcs/upload-audio`, {
+            method: "POST",
+            body: audioFormData,
+          }),
+          fetch(`${BACKEND_BASE_URL}/gcs/upload-script`, {
+            method: "POST",
+            body: scriptFormData,
+          }),
+        ]);
+
+        if (!audioSyncResponse.ok || !scriptSyncResponse.ok) {
+          throw new Error(
+            `GCS sync failed: audio=${audioSyncResponse.status} script=${scriptSyncResponse.status}`
+          );
+        }
+
+        resolvedWavUrl = absoluteBackendUrl(`/gcs/audio/${encodePathSegments(objectName)}`);
+        resolvedScriptUrl = absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(scriptId)}`);
+        pushStatusLog("[SYSTEM]: Asset synced to GCS");
+      } catch (syncError) {
+        console.error("Failed to sync generated asset to GCS", syncError);
+        pushStatusLog("[WARN]: Asset saved locally; GCS sync failed");
+      }
+
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
       setAssetCards((prev) => [
         {
@@ -725,7 +778,8 @@ export default function Page() {
           finalScript,
           timestamp: time,
           durationSeconds,
-          wavUrl: data.download_url
+          wavUrl: resolvedWavUrl,
+          scriptUrl: resolvedScriptUrl,
         },
         ...prev
       ]);
