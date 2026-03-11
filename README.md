@@ -155,3 +155,91 @@ Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 python -m pytest -q
 ```
+
+## Google Cloud Storage CLI (Audio + Scripts)
+
+Use the helper CLI to upload and retrieve `audio/` and `scripts/` objects in a GCS bucket.
+
+1. Authenticate locally:
+
+```bash
+gcloud auth application-default login
+```
+
+2. Set bucket (optional if using default `sceneone-media-prod`):
+
+```bash
+export GCS_BUCKET=sceneone-media-prod
+```
+
+3. Run commands:
+
+```bash
+# Upload audio
+python utils/gcloud_storage.py upload \
+  --audio-file exports/audio/sceneone_urban_explorer_25943017.wav \
+  --object-name sceneone_urban_explorer_25943017.wav
+
+# Upload script from text
+python utils/gcloud_storage.py upload \
+  --script-id urban_explorer \
+  --script-text "Your script text"
+
+# Upload script from file
+python utils/gcloud_storage.py upload \
+  --script-id urban_explorer \
+  --script-file exports/scripts/script_urban_explorer_20260306_145008.txt
+
+# Fetch script (prints to terminal)
+python utils/gcloud_storage.py get-script --script-id urban_explorer
+
+# Fetch script (save to file)
+python utils/gcloud_storage.py get-script --script-id urban_explorer --out /tmp/urban_explorer.txt
+
+# Fetch audio
+python utils/gcloud_storage.py get-audio \
+  --object-name sceneone_urban_explorer_25943017.wav \
+  --out /tmp/sceneone_urban_explorer_25943017.wav
+
+# List objects
+python utils/gcloud_storage.py list --kind all --max-results 100
+```
+
+Notes:
+- Audio is stored under `audio/<object-name>`.
+- Scripts are stored under `scripts/<script-id>.txt`.
+- Legacy entrypoint `python utils/gcloud-storage.py ...` still works.
+
+## FastAPI GCS Endpoints
+
+You can now use backend routes to store/retrieve GCS assets directly:
+
+```bash
+# Upload script text
+curl -X POST http://localhost:8000/gcs/upload-script \
+  -F script_id=urban_explorer \
+  -F script_text='Your script text'
+
+# Upload script file
+curl -X POST http://localhost:8000/gcs/upload-script \
+  -F script_id=urban_explorer \
+  -F script_file=@exports/scripts/script_urban_explorer_20260306_145008.txt
+
+# Upload audio
+curl -X POST http://localhost:8000/gcs/upload-audio \
+  -F file=@exports/audio/sceneone_urban_explorer_25943017.wav
+
+# Fetch script text
+curl http://localhost:8000/gcs/scripts/urban_explorer
+
+# Fetch audio
+curl -L http://localhost:8000/gcs/audio/sceneone_urban_explorer_25943017.wav \
+  -o /tmp/sceneone_urban_explorer_25943017.wav
+
+# List objects
+curl 'http://localhost:8000/gcs/list?kind=all&max_results=100'
+```
+
+Notes:
+- Pass an explicit bucket with `bucket` form/query field if needed; otherwise default is `GCS_BUCKET` env var or `sceneone-media-prod`.
+- `GET /gcs/audio/{object_name}` supports nested object names via path segments.

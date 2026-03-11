@@ -5,6 +5,7 @@ import uuid
 import asyncio
 import logging
 import json
+import mimetypes
 from pathlib import Path
 from contextlib import aclosing
 from typing import Literal
@@ -12,6 +13,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocketDisconnect
 from pydub import AudioSegment
@@ -224,6 +226,22 @@ def _parse_audio_file(path: Path) -> dict:
         "size_bytes": path.stat().st_size,
     }
 
+def _build_gcs_store(bucket_name: str | None = None):
+    try:
+        from utils.gcloud_storage import GCSAssetStore
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Google Cloud Storage support is unavailable. "
+                "Install dependencies with `pip install -r requirements.txt`."
+            ),
+        ) from exc
+    return GCSAssetStore(bucket_name=bucket_name)
+
+def _is_gcs_not_found(exc: Exception) -> bool:
+    return exc.__class__.__name__ == "NotFound"
+
 @app.get("/healthz")
 async def healthz():
     return {
@@ -254,6 +272,140 @@ async def list_assets():
     return {
         "audio": [_parse_audio_file(path) for path in audio_files],
         "scripts": [_parse_script_file(path) for path in script_files],
+    }
+
+@app.post("/gcs/upload-script")
+async def gcs_upload_script(
+    script_id: str = Form(...),
+    script_text: str | None = Form(default=None),
+    script_file: UploadFile | None = File(default=None),
+    bucket: str | None = Form(default=None),
+):
+    if bool(script_text) == bool(script_file):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of script_text or script_file.",
+        )
+
+    store = _build_gcs_store(bucket_name=bucket)
+    try:
+        if script_text is not None:
+            object_name = store.upload_script_text(script_id=script_id, text=script_text)
+        else:
+            raw = await script_file.read()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="script_file must be UTF-8 text.",
+                ) from exc
+            object_name = store.upload_script_text(script_id=script_id, text=text)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[gcs-upload-script] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to upload script: {exc}") from exc
+    finally:
+        if script_file:
+            await script_file.close()
+
+    return {
+        "status": "success",
+        "bucket": store.bucket_name,
+        "script_id": script_id,
+        "object_name": object_name,
+    }
+
+@app.post("/gcs/upload-audio")
+async def gcs_upload_audio(
+    file: UploadFile = File(...),
+    object_name: str | None = Form(default=None),
+    bucket: str | None = Form(default=None),
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing audio filename.")
+    if file.content_type and not file.content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be audio.")
+
+    safe_name = _safe_stem(file.filename)
+    suffix = Path(file.filename).suffix or ".wav"
+    resolved_object_name = object_name or f"{safe_name}_{uuid.uuid4().hex[:8]}{suffix}"
+
+    store = _build_gcs_store(bucket_name=bucket)
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded audio is empty.")
+        object_path = store.upload_audio_bytes(
+            data=data,
+            object_name=resolved_object_name,
+            content_type=file.content_type or "application/octet-stream",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[gcs-upload-audio] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to upload audio: {exc}") from exc
+    finally:
+        await file.close()
+
+    return {
+        "status": "success",
+        "bucket": store.bucket_name,
+        "object_name": object_path,
+    }
+
+@app.get("/gcs/scripts/{script_id}", response_class=PlainTextResponse)
+async def gcs_get_script(script_id: str, bucket: str | None = Query(default=None)):
+    store = _build_gcs_store(bucket_name=bucket)
+    try:
+        return PlainTextResponse(store.download_script_text(script_id=script_id))
+    except Exception as exc:
+        if _is_gcs_not_found(exc):
+            raise HTTPException(status_code=404, detail=f"Script '{script_id}' not found.") from exc
+        logger.exception("[gcs-get-script] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch script: {exc}") from exc
+
+@app.get("/gcs/audio/{object_name:path}")
+async def gcs_get_audio(object_name: str, bucket: str | None = Query(default=None)):
+    store = _build_gcs_store(bucket_name=bucket)
+    resolved_object_name = object_name.removeprefix("audio/")
+    try:
+        data = store.download_audio_bytes(object_name=resolved_object_name)
+    except Exception as exc:
+        if _is_gcs_not_found(exc):
+            raise HTTPException(status_code=404, detail=f"Audio '{object_name}' not found.") from exc
+        logger.exception("[gcs-get-audio] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch audio: {exc}") from exc
+
+    media_type = mimetypes.guess_type(resolved_object_name)[0] or "application/octet-stream"
+    return StreamingResponse(
+        iter([data]),
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{Path(resolved_object_name).name}"'},
+    )
+
+@app.get("/gcs/list")
+async def gcs_list_assets(
+    kind: Literal["audio", "scripts", "all"] = Query(default="all"),
+    prefix: str = Query(default=""),
+    max_results: int = Query(default=100, ge=1, le=1000),
+    bucket: str | None = Query(default=None),
+):
+    store = _build_gcs_store(bucket_name=bucket)
+    try:
+        items = store.list_objects(kind=kind, prefix=prefix, max_results=max_results)
+    except Exception as exc:
+        logger.exception("[gcs-list] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to list assets: {exc}") from exc
+
+    return {
+        "bucket": store.bucket_name,
+        "kind": kind,
+        "prefix": prefix,
+        "count": len(items),
+        "items": items,
     }
 
 @app.websocket("/run_live")
