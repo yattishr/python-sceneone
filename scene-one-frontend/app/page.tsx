@@ -28,20 +28,8 @@ type CaptureRequest = {
   final_script?: string;
   duration_seconds?: number;
 };
-type BackendAudioAsset = {
-  filename: string;
-  url: string;
-  modified_at: string;
-  size_bytes: number;
-};
-type BackendScriptAsset = {
-  filename: string;
-  url: string;
-  product_name: string;
-  duration_seconds?: number;
-  final_script: string;
-  modified_at: string;
-  size_bytes: number;
+type GcsListResponse = {
+  items?: string[];
 };
 
 
@@ -469,6 +457,63 @@ export default function Page() {
     return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "untitled";
   };
 
+  const encodePathSegments = (value: string): string => {
+    return value.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  };
+
+  const parseScriptContent = (scriptId: string, content: string): {
+    productName: string;
+    finalScript: string;
+    durationSeconds: AllowedDurationSeconds;
+  } => {
+    const lines = content.split(/\r?\n/);
+    let productName = scriptId.replace(/[_-]+/g, " ").trim() || "Untitled Product";
+    let durationSeconds: AllowedDurationSeconds = DEFAULT_DURATION_SECONDS;
+    let finalScript = content.trim() || "No script text.";
+
+    if (lines[0]?.startsWith("PRODUCT:")) {
+      const value = lines[0].split(":", 2)[1]?.trim();
+      if (value) {
+        productName = value;
+      }
+    }
+
+    for (const line of lines) {
+      if (!line.startsWith("DURATION_SECONDS:")) {
+        continue;
+      }
+      const parsed = Number(line.split(":", 2)[1]?.trim());
+      if (isAllowedDurationSeconds(parsed)) {
+        durationSeconds = parsed;
+      }
+      break;
+    }
+
+    const marker = "--- SCRIPT ---";
+    const markerIndex = content.indexOf(marker);
+    if (markerIndex >= 0) {
+      const extracted = content.slice(markerIndex + marker.length).trim();
+      if (extracted) {
+        finalScript = extracted;
+      }
+    }
+
+    return { productName, finalScript, durationSeconds };
+  };
+
+  const deriveAudioKey = (objectPath: string): string => {
+    const filename = objectPath.split("/").pop() ?? objectPath;
+    const sceneOneMatch = /^sceneone_(.+)_[a-f0-9]{8}\.[a-z0-9]+$/i.exec(filename);
+    if (sceneOneMatch) {
+      return sceneOneMatch[1];
+    }
+    const genericMatch = /^(.+?)_[a-f0-9]{8}\.[a-z0-9]+$/i.exec(filename);
+    if (genericMatch) {
+      return genericMatch[1];
+    }
+    return filename.replace(/\.[^.]+$/, "");
+  };
+
   const absoluteBackendUrl = (path: string): string => {
     if (/^https?:\/\//i.test(path)) {
       return path;
@@ -505,50 +550,74 @@ export default function Page() {
   };
 
   const loadAssetsFromBackend = async (): Promise<AssetCard[]> => {
-    const response = await fetch(`${BACKEND_BASE_URL}/assets`);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch assets: ${response.status}`);
-    }
-    const payload = await response.json() as {
-      audio?: BackendAudioAsset[];
-      scripts?: BackendScriptAsset[];
-    };
-
-    const audioItems = Array.isArray(payload.audio) ? payload.audio : [];
-    const scriptItems = Array.isArray(payload.scripts) ? payload.scripts : [];
-    const audioMap = new Map<string, BackendAudioAsset[]>();
-    for (const audio of audioItems) {
-      if (typeof audio.filename !== "string" || typeof audio.url !== "string") {
-        continue;
-      }
-      const match = /^sceneone_(.+)_[a-f0-9]{8}\.wav$/i.exec(audio.filename);
-      if (!match) {
-        continue;
-      }
-      const key = match[1];
-      const existing = audioMap.get(key) ?? [];
-      existing.push(audio);
-      audioMap.set(key, existing);
+    const [audioResponse, scriptResponse] = await Promise.all([
+      fetch(`${BACKEND_BASE_URL}/gcs/list?kind=audio&max_results=80`),
+      fetch(`${BACKEND_BASE_URL}/gcs/list?kind=scripts&max_results=80`),
+    ]);
+    if (!audioResponse.ok || !scriptResponse.ok) {
+      throw new Error(
+        `Failed to fetch GCS assets: audio=${audioResponse.status} scripts=${scriptResponse.status}`
+      );
     }
 
-    return scriptItems
-      .filter((script) => typeof script.product_name === "string" && typeof script.final_script === "string")
-      .map((script) => {
-        const key = safeProductKey(script.product_name);
-        const audio = (audioMap.get(key) ?? [])[0];
-        const durationSeconds = isAllowedDurationSeconds(Number(script.duration_seconds))
-          ? Number(script.duration_seconds)
-          : DEFAULT_DURATION_SECONDS;
-        return {
-          productName: script.product_name,
-          finalScript: script.final_script,
-          timestamp: new Date(script.modified_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-          durationSeconds,
-          wavUrl: audio ? absoluteBackendUrl(audio.url) : "",
-          scriptUrl: typeof script.url === "string" ? absoluteBackendUrl(script.url) : undefined,
-        };
-      })
-      .slice(0, 40);
+    const audioPayload = (await audioResponse.json()) as GcsListResponse;
+    const scriptPayload = (await scriptResponse.json()) as GcsListResponse;
+    const audioItems = Array.isArray(audioPayload.items) ? audioPayload.items : [];
+    const scriptItems = Array.isArray(scriptPayload.items) ? scriptPayload.items : [];
+
+    const audioMap = new Map<string, string>();
+    for (const item of audioItems) {
+      if (typeof item !== "string") {
+        continue;
+      }
+      const objectPath = item.replace(/^audio\/+/, "");
+      const key = safeProductKey(deriveAudioKey(objectPath));
+      if (!audioMap.has(key)) {
+        audioMap.set(key, objectPath);
+      }
+    }
+
+    const scriptCards = await Promise.all(
+      scriptItems
+        .filter((item): item is string => typeof item === "string" && item.endsWith(".txt"))
+        .slice(0, 40)
+        .map(async (item) => {
+          const objectPath = item.replace(/^scripts\/+/, "");
+          const scriptId = objectPath.replace(/\.txt$/i, "");
+          if (!scriptId || scriptId.includes("/")) {
+            return null;
+          }
+
+          const scriptTextResponse = await fetch(
+            `${BACKEND_BASE_URL}/gcs/scripts/${encodeURIComponent(scriptId)}`
+          );
+          if (!scriptTextResponse.ok) {
+            return null;
+          }
+
+          const scriptText = await scriptTextResponse.text();
+          const parsed = parseScriptContent(scriptId, scriptText);
+          const key = safeProductKey(parsed.productName);
+          const audioObjectPath = audioMap.get(key);
+
+          return {
+            productName: parsed.productName,
+            finalScript: parsed.finalScript,
+            timestamp: new Date().toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            }),
+            durationSeconds: parsed.durationSeconds,
+            wavUrl: audioObjectPath
+              ? absoluteBackendUrl(`/gcs/audio/${encodePathSegments(audioObjectPath)}`)
+              : "",
+            scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(scriptId)}`),
+          } satisfies AssetCard;
+        })
+    );
+
+    return scriptCards.filter((card): card is AssetCard => Boolean(card));
   };
 
   const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
@@ -1034,7 +1103,7 @@ export default function Page() {
           return;
         }
       } catch (error) {
-        console.error("Failed to load assets from backend", error);
+        console.error("Failed to load assets from GCS backend", error);
       }
 
       try {
@@ -1190,7 +1259,7 @@ export default function Page() {
                     const cards = await loadAssetsFromBackend();
                     if (cards.length > 0) {
                       setAssetCards(cards);
-                      pushStatusLog("[SYSTEM]: Asset Dock synced from backend");
+                      pushStatusLog("[SYSTEM]: Asset Dock synced from GCS");
                       return;
                     }
                   } catch (error) {
