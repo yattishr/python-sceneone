@@ -3,12 +3,15 @@ import { useCopilotAction, useCopilotReadable } from "@copilotkit/react-core";
 import { useEffect, useState, useRef } from "react";
 
 type AssetCard = {
+  assetId: string;
   productName: string;
   finalScript: string;
   timestamp: string;
   durationSeconds: number;
   wavUrl: string;
   scriptUrl?: string;
+  status: "capturing" | "finalizing_wav" | "syncing_gcs" | "ready" | "failed";
+  errorMessage?: string;
 };
 
 type BrowserSpeechRecognition = {
@@ -24,6 +27,7 @@ type BrowserSpeechRecognition = {
 
 type SpeechRecognitionFactory = new () => BrowserSpeechRecognition;
 type CaptureRequest = {
+  asset_id?: string;
   product_name?: string;
   final_script?: string;
   duration_seconds?: number;
@@ -51,7 +55,8 @@ const MAX_DIRECTOR_BUFFER_MS = 30_000;
 const TTS_WARMUP_MS = 800;
 const LIVE_RECONNECT_BASE_DELAY_MS = 1200;
 const LIVE_RECONNECT_MAX_ATTEMPTS = 6;
-const AUTO_END_AFTER_CAPTURE_MS = 1600;
+const GCS_UPLOAD_MAX_ATTEMPTS = 3;
+const GCS_UPLOAD_RETRY_DELAY_MS = 700;
 const durationToMs = (seconds: number): number => seconds * 1000;
 const isAllowedDurationSeconds = (value: number): value is AllowedDurationSeconds => (
   ALLOWED_DURATIONS_SECONDS.includes(value as AllowedDurationSeconds)
@@ -77,11 +82,13 @@ export default function Page() {
   const directorPcmBytesRef = useRef(0);
   const directorSampleRateRef = useRef(DIRECTOR_DEFAULT_SAMPLE_RATE);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const stopAfterCaptureRef = useRef(false);
+  const pendingCaptureRequestRef = useRef<CaptureRequest | null>(null);
+  const currentFinalizePromiseRef = useRef<Promise<void> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectInFlightRef = useRef(false);
   const intentionalSocketCloseRef = useRef(false);
+  const assetCardsRef = useRef<AssetCard[]>([]);
 
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -436,6 +443,7 @@ export default function Page() {
       return null;
     }
     const candidate = value as Record<string, unknown>;
+    const assetId = candidate.asset_id;
     const productName = candidate.product_name;
     const finalScript = candidate.final_script;
     const durationRaw = candidate.duration_seconds;
@@ -445,6 +453,7 @@ export default function Page() {
         ? Number(durationRaw)
         : undefined;
     return {
+      asset_id: typeof assetId === "string" ? assetId : undefined,
       product_name: typeof productName === "string" ? productName : undefined,
       final_script: typeof finalScript === "string" ? finalScript : undefined,
       duration_seconds: typeof durationValue === "number" && Number.isFinite(durationValue)
@@ -457,25 +466,47 @@ export default function Page() {
     return value.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "untitled";
   };
 
+  const createAssetId = (productName: string): string => {
+    const suffix = Math.random().toString(16).slice(2, 8);
+    return `${safeProductKey(productName)}_${Date.now()}_${suffix}`;
+  };
+
   const encodePathSegments = (value: string): string => {
     return value.split("/").map((segment) => encodeURIComponent(segment)).join("/");
   };
 
   const parseScriptContent = (scriptId: string, content: string): {
+    assetId: string;
     productName: string;
     finalScript: string;
     durationSeconds: AllowedDurationSeconds;
   } => {
     const lines = content.split(/\r?\n/);
+    let assetId = scriptId.trim();
     let productName = scriptId.replace(/[_-]+/g, " ").trim() || "Untitled Product";
     let durationSeconds: AllowedDurationSeconds = DEFAULT_DURATION_SECONDS;
     let finalScript = content.trim() || "No script text.";
 
-    if (lines[0]?.startsWith("PRODUCT:")) {
-      const value = lines[0].split(":", 2)[1]?.trim();
+    for (const line of lines) {
+      if (!line.startsWith("PRODUCT:")) {
+        continue;
+      }
+      const value = line.split(":", 2)[1]?.trim();
       if (value) {
         productName = value;
       }
+      break;
+    }
+
+    for (const line of lines) {
+      if (!line.startsWith("ASSET_ID:")) {
+        continue;
+      }
+      const value = line.split(":", 2)[1]?.trim();
+      if (value) {
+        assetId = value;
+      }
+      break;
     }
 
     for (const line of lines) {
@@ -498,7 +529,7 @@ export default function Page() {
       }
     }
 
-    return { productName, finalScript, durationSeconds };
+    return { assetId, productName, finalScript, durationSeconds };
   };
 
   const deriveAudioKey = (objectPath: string): string => {
@@ -514,8 +545,22 @@ export default function Page() {
     return filename.replace(/\.[^.]+$/, "");
   };
 
-  const buildScriptDocument = (productName: string, durationSeconds: number, finalScript: string): string => {
-    return `PRODUCT: ${productName}\nDURATION_SECONDS: ${durationSeconds}\n--- SCRIPT ---\n${finalScript}`.trim();
+  const buildScriptDocument = (
+    assetId: string,
+    productName: string,
+    durationSeconds: number,
+    finalScript: string,
+  ): string => {
+    return `ASSET_ID: ${assetId}\nPRODUCT: ${productName}\nDURATION_SECONDS: ${durationSeconds}\n--- SCRIPT ---\n${finalScript}`.trim();
+  };
+
+  const deriveAssetIdFromAudioPath = (objectPath: string): string => {
+    const filename = objectPath.split("/").pop() ?? objectPath;
+    return filename.replace(/\.[^.]+$/, "");
+  };
+
+  const wait = async (ms: number) => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   };
 
   const absoluteBackendUrl = (path: string): string => {
@@ -523,6 +568,54 @@ export default function Page() {
       return path;
     }
     return `${BACKEND_BASE_URL.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+  };
+
+  const upsertAssetCard = (next: AssetCard) => {
+    setAssetCards((prev) => {
+      const index = prev.findIndex((item) => item.assetId === next.assetId);
+      if (index < 0) {
+        return [next, ...prev].slice(0, 40);
+      }
+      const copy = [...prev];
+      copy[index] = { ...copy[index], ...next };
+      return copy;
+    });
+  };
+
+  const patchAssetCard = (assetId: string, patch: Partial<AssetCard>) => {
+    setAssetCards((prev) => prev.map((item) => (item.assetId === assetId ? { ...item, ...patch } : item)));
+  };
+
+  const syncAssetWithRetries = async (
+    assetId: string,
+    wavBlob: Blob,
+    productName: string,
+    durationSeconds: AllowedDurationSeconds,
+    finalScript: string,
+  ) => {
+    const scriptText = buildScriptDocument(assetId, productName, durationSeconds, finalScript);
+
+    for (let attempt = 1; attempt <= GCS_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+      const formData = new FormData();
+      formData.append("asset_id", assetId);
+      formData.append("script_text", scriptText);
+      formData.append("file", wavBlob, `${assetId}.wav`);
+
+      const response = await fetch(`${BACKEND_BASE_URL}/gcs/upload-asset`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (response.ok) {
+        return;
+      }
+
+      if (attempt < GCS_UPLOAD_MAX_ATTEMPTS) {
+        await wait(GCS_UPLOAD_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+      throw new Error(`GCS sync failed after ${GCS_UPLOAD_MAX_ATTEMPTS} attempts (status ${response.status})`);
+    }
   };
 
   const restoreAssetCardsFromLocalStorage = (): AssetCard[] => {
@@ -538,18 +631,41 @@ export default function Page() {
       return [];
     }
     return parsed
-      .filter((item): item is AssetCard => {
-        return Boolean(
-          item &&
-          typeof item.productName === "string" &&
-          typeof item.finalScript === "string" &&
-          typeof item.timestamp === "string" &&
-          typeof item.durationSeconds === "number" &&
-          isAllowedDurationSeconds(item.durationSeconds) &&
-          typeof item.wavUrl === "string" &&
-          (typeof item.scriptUrl === "undefined" || typeof item.scriptUrl === "string")
-        );
+      .map((item): AssetCard | null => {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        const productName = typeof item.productName === "string" ? item.productName : "Untitled Product";
+        const durationSeconds = Number(item.durationSeconds);
+        if (!isAllowedDurationSeconds(durationSeconds)) {
+          return null;
+        }
+        const wavUrl = typeof item.wavUrl === "string" ? item.wavUrl : "";
+        const status = item.status;
+        const resolvedStatus = (
+          status === "capturing" ||
+          status === "finalizing_wav" ||
+          status === "syncing_gcs" ||
+          status === "ready" ||
+          status === "failed"
+        )
+          ? status
+          : (wavUrl ? "ready" : "failed");
+        return {
+          assetId: typeof item.assetId === "string" && item.assetId
+            ? item.assetId
+            : createAssetId(productName),
+          productName,
+          finalScript: typeof item.finalScript === "string" ? item.finalScript : "No script text.",
+          timestamp: typeof item.timestamp === "string" ? item.timestamp : new Date().toLocaleTimeString(),
+          durationSeconds,
+          wavUrl,
+          scriptUrl: typeof item.scriptUrl === "string" ? item.scriptUrl : "",
+          status: resolvedStatus,
+          errorMessage: typeof item.errorMessage === "string" ? item.errorMessage : undefined,
+        };
       })
+      .filter((item): item is AssetCard => Boolean(item))
       .slice(0, 40);
   };
 
@@ -569,15 +685,20 @@ export default function Page() {
     const audioItems = Array.isArray(audioPayload.items) ? audioPayload.items : [];
     const scriptItems = Array.isArray(scriptPayload.items) ? scriptPayload.items : [];
 
-    const audioMap = new Map<string, string>();
+    const audioByAssetId = new Map<string, string>();
+    const legacyAudioByProductKey = new Map<string, string>();
     for (const item of audioItems) {
       if (typeof item !== "string") {
         continue;
       }
       const objectPath = item.replace(/^audio\/+/, "");
-      const key = safeProductKey(deriveAudioKey(objectPath));
-      if (!audioMap.has(key)) {
-        audioMap.set(key, objectPath);
+      const assetId = deriveAssetIdFromAudioPath(objectPath);
+      if (assetId && !audioByAssetId.has(assetId)) {
+        audioByAssetId.set(assetId, objectPath);
+      }
+      const legacyKey = safeProductKey(deriveAudioKey(objectPath));
+      if (!legacyAudioByProductKey.has(legacyKey)) {
+        legacyAudioByProductKey.set(legacyKey, objectPath);
       }
     }
 
@@ -601,10 +722,12 @@ export default function Page() {
 
           const scriptText = await scriptTextResponse.text();
           const parsed = parseScriptContent(scriptId, scriptText);
-          const key = safeProductKey(parsed.productName);
-          const audioObjectPath = audioMap.get(key);
+          const audioObjectPath = audioByAssetId.get(parsed.assetId)
+            ?? legacyAudioByProductKey.get(safeProductKey(parsed.productName));
+          const isReady = Boolean(audioObjectPath);
 
           return {
+            assetId: parsed.assetId,
             productName: parsed.productName,
             finalScript: parsed.finalScript,
             timestamp: new Date().toLocaleTimeString([], {
@@ -617,6 +740,8 @@ export default function Page() {
               ? absoluteBackendUrl(`/gcs/audio/${encodePathSegments(audioObjectPath)}`)
               : "",
             scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(scriptId)}`),
+            status: isReady ? "ready" : "failed",
+            errorMessage: isReady ? undefined : "WAV missing for this script in storage.",
           } satisfies AssetCard;
         })
     );
@@ -647,178 +772,152 @@ export default function Page() {
     return null;
   };
 
-  const captureAndUploadAudio = async (request: CaptureRequest, source: "copilot" | "live") => {
-    if (isCaptureInProgressRef.current) {
-      pushStatusLog("[SYSTEM]: Capture already in progress");
-      return;
+  const captureAndUploadAudio = (request: CaptureRequest, source: "copilot" | "live") => {
+    pendingCaptureRequestRef.current = request;
+    if (currentFinalizePromiseRef.current) {
+      return currentFinalizePromiseRef.current;
     }
 
-    const productName = (request.product_name || "untitled").trim() || "untitled";
-    const finalScript = (request.final_script || lastDirectorTextRef.current || "No script text.").trim();
-    const durationSeconds = isAllowedDurationSeconds(Number(request.duration_seconds))
-      ? Number(request.duration_seconds)
-      : selectedDurationSeconds;
-    const recordingDurationMs = durationToMs(durationSeconds);
-    const captureKey = `${productName}::${durationSeconds}::${finalScript}`;
-    if (captureKey === lastCaptureKeyRef.current) {
-      return;
-    }
-
-    isCaptureInProgressRef.current = true;
-    lastCaptureKeyRef.current = captureKey;
-    updateCaptureProgress(`Preparing ${durationSeconds}s clip...`, 10);
-    pushStatusLog(`🎬 [ACTION]: Rendering ${durationSeconds}s script voiceover (${source})...`);
-
-    try {
-      if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
-        throw new Error("Live director socket is not connected.");
+    const run = (async () => {
+      const productName = (request.product_name || "untitled").trim() || "untitled";
+      const finalScript = (request.final_script || lastDirectorTextRef.current || "No script text.").trim();
+      const durationSeconds = isAllowedDurationSeconds(Number(request.duration_seconds))
+        ? Number(request.duration_seconds)
+        : selectedDurationSeconds;
+      const assetId = (request.asset_id || createAssetId(productName)).trim();
+      const recordingDurationMs = durationToMs(durationSeconds);
+      const captureKey = `${assetId}::${durationSeconds}::${finalScript}`;
+      pendingCaptureRequestRef.current = {
+        asset_id: assetId,
+        product_name: productName,
+        final_script: finalScript,
+        duration_seconds: durationSeconds,
+      };
+      if (captureKey === lastCaptureKeyRef.current) {
+        pendingCaptureRequestRef.current = null;
+        return;
       }
 
-      directorPcmChunksRef.current = [];
-      directorPcmBytesRef.current = 0;
-      updateCaptureProgress("Rendering script voiceover...", 30);
-      await sendDirectorMessage(
-        `Read this ad script verbatim with no intro or outro. Keep pacing aligned to exactly ${durationSeconds} seconds. Output only the script as spoken audio:\n${finalScript}`
-      );
-      await new Promise((resolve) => setTimeout(resolve, recordingDurationMs + TTS_WARMUP_MS));
-
-      const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
-      updateCaptureProgress("Assembling captured audio...", 60);
-      const wantedBytes = Math.floor(
-        (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * recordingDurationMs) / 1000
-      );
-      const recentPcm = getRecentDirectorPcm(wantedBytes);
-      if (recentPcm.length < sampleRate * PCM16_BYTES_PER_SAMPLE) {
-        throw new Error("No director audio captured yet. Let the director speak, then try again.");
-      }
-
-      const wavBlob = pcm16ToWavBlob(recentPcm, sampleRate);
-      const safeName = productName.replace(/\s+/g, "_").toLowerCase();
-      const formData = new FormData();
-      formData.append("file", wavBlob, `${safeName}.wav`);
-      formData.append("duration_seconds", String(durationSeconds));
-      updateCaptureProgress("Uploading clip for WAV finalization...", 80);
-
-      const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
-        method: "POST",
-        body: formData,
+      lastCaptureKeyRef.current = captureKey;
+      isCaptureInProgressRef.current = true;
+      upsertAssetCard({
+        assetId,
+        productName,
+        finalScript,
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+        durationSeconds,
+        wavUrl: "",
+        scriptUrl: "",
+        status: "capturing",
       });
-      if (!response.ok) {
-        let detail = `Upload failed with status ${response.status}`;
-        try {
-          const payload = await response.json();
-          if (payload?.detail) {
-            detail = `${detail}: ${payload.detail}`;
-          }
-        } catch {
-          // non-JSON error response
-        }
-        throw new Error(detail);
-      }
+      updateCaptureProgress(`Preparing ${durationSeconds}s clip...`, 10);
+      pushStatusLog(`🎬 [ACTION]: Rendering ${durationSeconds}s script voiceover (${source})...`);
 
-      const data = await response.json();
-      if (!data.download_url) {
-        throw new Error("Upload succeeded but no download URL returned.");
-      }
-      updateCaptureProgress("Finalizing clip...", 100);
-
-      let resolvedWavUrl = absoluteBackendUrl(String(data.download_url));
-      let resolvedScriptUrl: string | undefined;
       try {
-        const finalWavResponse = await fetch(resolvedWavUrl);
+        if (!liveSocketRef.current || liveSocketRef.current.readyState !== WebSocket.OPEN) {
+          throw new Error("Live director socket is not connected.");
+        }
+
+        directorPcmChunksRef.current = [];
+        directorPcmBytesRef.current = 0;
+        updateCaptureProgress("Rendering script voiceover...", 30);
+        await sendDirectorMessage(
+          `Read this ad script verbatim with no intro or outro. Keep pacing aligned to exactly ${durationSeconds} seconds. Output only the script as spoken audio:\n${finalScript}`
+        );
+        await wait(recordingDurationMs + TTS_WARMUP_MS);
+
+        const sampleRate = directorSampleRateRef.current || DIRECTOR_DEFAULT_SAMPLE_RATE;
+        updateCaptureProgress("Assembling captured audio...", 60);
+        const wantedBytes = Math.floor(
+          (sampleRate * PCM16_BYTES_PER_SAMPLE * DIRECTOR_AUDIO_CHANNELS * recordingDurationMs) / 1000
+        );
+        const recentPcm = getRecentDirectorPcm(wantedBytes);
+        if (recentPcm.length < sampleRate * PCM16_BYTES_PER_SAMPLE) {
+          throw new Error("No director audio captured yet. Let the director speak, then try again.");
+        }
+
+        patchAssetCard(assetId, { status: "finalizing_wav", errorMessage: undefined });
+        updateCaptureProgress("Generating WAV...", 80);
+        const wavBlob = pcm16ToWavBlob(recentPcm, sampleRate);
+        const safeName = productName.replace(/\s+/g, "_").toLowerCase();
+        const formData = new FormData();
+        formData.append("file", wavBlob, `${safeName}.wav`);
+        formData.append("duration_seconds", String(durationSeconds));
+
+        const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
+          method: "POST",
+          body: formData,
+        });
+        if (!response.ok) {
+          let detail = `Upload failed with status ${response.status}`;
+          try {
+            const payload = await response.json();
+            if (payload?.detail) {
+              detail = `${detail}: ${payload.detail}`;
+            }
+          } catch {
+            // non-JSON error response
+          }
+          throw new Error(detail);
+        }
+
+        const data = await response.json();
+        if (!data.download_url) {
+          throw new Error("Upload succeeded but no download URL returned.");
+        }
+        const localWavUrl = absoluteBackendUrl(String(data.download_url));
+        patchAssetCard(assetId, { wavUrl: localWavUrl, status: "syncing_gcs", errorMessage: undefined });
+        updateCaptureProgress("Uploading asset...", 95);
+
+        const finalWavResponse = await fetch(localWavUrl);
         if (!finalWavResponse.ok) {
           throw new Error(`Failed to fetch finalized WAV: ${finalWavResponse.status}`);
         }
         const finalWavBlob = await finalWavResponse.blob();
-        const objectName = decodeURIComponent(
-          String(data.download_url).split("/").pop() || `${safeName}_${Date.now()}.wav`
-        );
-        const scriptId = objectName.replace(/\.[^.]+$/, "");
-
-        const audioFormData = new FormData();
-        audioFormData.append("file", finalWavBlob, objectName);
-        audioFormData.append("object_name", objectName);
-
-        const scriptFormData = new FormData();
-        scriptFormData.append("script_id", scriptId);
-        scriptFormData.append(
-          "script_text",
-          buildScriptDocument(productName, durationSeconds, finalScript)
-        );
-
-        const [audioSyncResponse, scriptSyncResponse] = await Promise.all([
-          fetch(`${BACKEND_BASE_URL}/gcs/upload-audio`, {
-            method: "POST",
-            body: audioFormData,
-          }),
-          fetch(`${BACKEND_BASE_URL}/gcs/upload-script`, {
-            method: "POST",
-            body: scriptFormData,
-          }),
-        ]);
-
-        if (!audioSyncResponse.ok || !scriptSyncResponse.ok) {
-          throw new Error(
-            `GCS sync failed: audio=${audioSyncResponse.status} script=${scriptSyncResponse.status}`
-          );
+        await syncAssetWithRetries(assetId, finalWavBlob, productName, durationSeconds, finalScript);
+        patchAssetCard(assetId, {
+          wavUrl: absoluteBackendUrl(`/gcs/audio/${encodePathSegments(`${assetId}.wav`)}`),
+          scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(assetId)}`),
+          status: "ready",
+          errorMessage: undefined,
+        });
+        updateCaptureProgress("Asset ready", 100);
+        const pending = pendingCaptureRequestRef.current;
+        if (!pending || !pending.asset_id || pending.asset_id === assetId) {
+          pendingCaptureRequestRef.current = null;
         }
-
-        resolvedWavUrl = absoluteBackendUrl(`/gcs/audio/${encodePathSegments(objectName)}`);
-        resolvedScriptUrl = absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(scriptId)}`);
         pushStatusLog("[SYSTEM]: Asset synced to GCS");
-      } catch (syncError) {
-        console.error("Failed to sync generated asset to GCS", syncError);
-        pushStatusLog("[WARN]: Asset saved locally; GCS sync failed");
-      }
-
-      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      setAssetCards((prev) => [
-        {
-          productName,
-          finalScript,
-          timestamp: time,
-          durationSeconds,
-          wavUrl: resolvedWavUrl,
-          scriptUrl: resolvedScriptUrl,
-        },
-        ...prev
-      ]);
-      pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
-      showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
-      if (source === "live" && isSessionActiveRef.current && !stopAfterCaptureRef.current) {
-        setIsStopQueued(true);
-        pushStatusLog("[SYSTEM]: Clip ready. Ending live session...");
+        pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
+        showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
+      } catch (error) {
+        console.error("Director capture failed", error);
+        const message = error instanceof Error ? error.message : "Director audio export failed";
+        patchAssetCard(assetId, { status: "failed", errorMessage: message });
+        const pending = pendingCaptureRequestRef.current;
+        if (!pending || !pending.asset_id || pending.asset_id === assetId) {
+          pendingCaptureRequestRef.current = null;
+        }
+        pushStatusLog(`[ERROR]: ${message}`);
+      } finally {
+        isCaptureInProgressRef.current = false;
         setTimeout(() => {
-          if (isSessionActiveRef.current) {
-            stopProduction();
-          }
-        }, AUTO_END_AFTER_CAPTURE_MS);
+          setCaptureProgressLabel("");
+          setCaptureProgressPercent(0);
+        }, 900);
       }
-    } catch (error) {
-      isCaptureInProgressRef.current = false;
-      setCaptureProgressLabel("");
-      setCaptureProgressPercent(0);
-      console.error("Director capture failed", error);
-      const message = error instanceof Error ? error.message : "Director audio export failed";
-      pushStatusLog(`[ERROR]: ${message}`);
-      if (stopAfterCaptureRef.current) {
-        stopAfterCaptureRef.current = false;
-        setIsStopQueued(false);
-        stopProduction();
-      }
-      return;
-    }
+    })();
 
-    isCaptureInProgressRef.current = false;
-    setTimeout(() => {
-      setCaptureProgressLabel("");
-      setCaptureProgressPercent(0);
-    }, 900);
-    if (stopAfterCaptureRef.current) {
-      stopAfterCaptureRef.current = false;
-      setIsStopQueued(false);
-      stopProduction();
-    }
+    const finalizePromise = run.finally(() => {
+      if (currentFinalizePromiseRef.current === finalizePromise) {
+        currentFinalizePromiseRef.current = null;
+      }
+    });
+    currentFinalizePromiseRef.current = finalizePromise;
+    return finalizePromise;
   };
 
   const getLiveSocketUrl = (sessionId: string) => {
@@ -1115,13 +1214,82 @@ export default function Page() {
     })();
   }
 
-  const requestStopProduction = () => {
-    if (isCaptureInProgressRef.current) {
-      stopAfterCaptureRef.current = true;
-      setIsStopQueued(true);
-      pushStatusLog("[SYSTEM]: Finishing current clip before ending session...");
+  const retryAssetSync = async (asset: AssetCard) => {
+    if (asset.status === "ready") {
       return;
     }
+    if (!asset.wavUrl) {
+      await captureAndUploadAudio(
+        {
+          asset_id: asset.assetId,
+          product_name: asset.productName,
+          final_script: asset.finalScript,
+          duration_seconds: asset.durationSeconds,
+        },
+        "copilot"
+      );
+      return;
+    }
+
+    patchAssetCard(asset.assetId, { status: "syncing_gcs", errorMessage: undefined });
+    try {
+      const wavResponse = await fetch(asset.wavUrl);
+      if (!wavResponse.ok) {
+        throw new Error(`Could not read finalized WAV (${wavResponse.status}).`);
+      }
+      const wavBlob = await wavResponse.blob();
+      await syncAssetWithRetries(
+        asset.assetId,
+        wavBlob,
+        asset.productName,
+        asset.durationSeconds,
+        asset.finalScript,
+      );
+      patchAssetCard(asset.assetId, {
+        status: "ready",
+        wavUrl: absoluteBackendUrl(`/gcs/audio/${encodePathSegments(`${asset.assetId}.wav`)}`),
+        scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(asset.assetId)}`),
+        errorMessage: undefined,
+      });
+      pushStatusLog("[SYSTEM]: Asset synced to GCS");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Retry sync failed";
+      patchAssetCard(asset.assetId, { status: "failed", errorMessage: message });
+      pushStatusLog(`[ERROR]: ${message}`);
+    }
+  };
+
+  const requestStopProduction = async () => {
+    setIsStopQueued(true);
+    pushStatusLog("[SYSTEM]: Finishing current clip before ending session...");
+    const hadInFlightFinalization = Boolean(
+      currentFinalizePromiseRef.current || pendingCaptureRequestRef.current
+    );
+
+    try {
+      if (currentFinalizePromiseRef.current) {
+        await currentFinalizePromiseRef.current;
+      } else if (pendingCaptureRequestRef.current) {
+        await captureAndUploadAudio(pendingCaptureRequestRef.current, "live");
+      }
+    } catch {
+      // Allow session close even if finalization failed.
+    }
+    if (hadInFlightFinalization) {
+      await wait(120);
+      const cards = assetCardsRef.current;
+      const readyCount = cards.filter((asset) => asset.status === "ready").length;
+      const failedCount = cards.filter((asset) => asset.status === "failed").length;
+      const inProgressCount = cards.filter((asset) => (
+        asset.status === "capturing" ||
+        asset.status === "finalizing_wav" ||
+        asset.status === "syncing_gcs"
+      )).length;
+      const summary = `Finalization summary: ready=${readyCount}, failed=${failedCount}, in-progress=${inProgressCount}`;
+      pushStatusLog(`[SYSTEM]: ${summary}`);
+      showToast(summary);
+    }
+
     stopProduction();
   };
 
@@ -1137,12 +1305,13 @@ export default function Page() {
     name: "capture_ad_script",
     description: "Alerts the UI that a script is ready and triggers a duration-based audio capture.",
     parameters: [
+      { name: "asset_id", type: "string" },
       { name: "product_name", type: "string" },
       { name: "final_script", type: "string" },
       { name: "duration_seconds", type: "number" }
     ],
-    handler: async ({ product_name, final_script, duration_seconds }) => {
-      await captureAndUploadAudio({ product_name, final_script, duration_seconds }, "copilot");
+    handler: async ({ asset_id, product_name, final_script, duration_seconds }) => {
+      await captureAndUploadAudio({ asset_id, product_name, final_script, duration_seconds }, "copilot");
     }
   });
 
@@ -1175,6 +1344,10 @@ export default function Page() {
       isCancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    assetCardsRef.current = assetCards;
+  }, [assetCards]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1213,6 +1386,18 @@ export default function Page() {
   const timerText = new Date(elapsedSeconds * 1000).toISOString().substring(11, 19);
   const personaMode = "HYPE-LINK";
   const latestDirectorLine = liveFeedLogs.find((line) => line.startsWith("[DIRECTOR]:")) ?? "Awaiting director guidance";
+  const getAssetStatusLabel = (asset: AssetCard): string => {
+    if (asset.status === "capturing" || asset.status === "finalizing_wav") {
+      return "Generating WAV...";
+    }
+    if (asset.status === "syncing_gcs") {
+      return "Uploading asset...";
+    }
+    if (asset.status === "failed") {
+      return "Upload failed - Retry";
+    }
+    return "WAV ready";
+  };
 
   return (
     <main className="studio-shell min-h-screen px-4 py-6 md:px-8 md:py-8">
@@ -1364,17 +1549,25 @@ export default function Page() {
               </div>
             ) : (
               assetCards.map((asset) => (
-                <div key={`${asset.productName}-${asset.timestamp}`} className="asset-card">
+                <div key={asset.assetId} className="asset-card">
                   <p className="asset-name">{asset.productName}</p>
                   <p className="asset-time">{asset.timestamp} · {asset.durationSeconds}s</p>
                   <div className="mt-4 flex gap-2">
-                    {asset.wavUrl ? (
+                    {asset.status === "ready" && asset.wavUrl ? (
                       <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>
                         Download .WAV
                       </a>
                     ) : (
-                      <button className="studio-btn studio-btn-secondary" disabled>
-                        {captureProgressLabel ? "WAV generating..." : "WAV pending"}
+                      <button
+                        className="studio-btn studio-btn-secondary"
+                        disabled={asset.status !== "failed"}
+                        onClick={async () => {
+                          if (asset.status === "failed") {
+                            await retryAssetSync(asset);
+                          }
+                        }}
+                      >
+                        {getAssetStatusLabel(asset)}
                       </button>
                     )}
                     {asset.scriptUrl ? (
@@ -1389,6 +1582,9 @@ export default function Page() {
                       Copy Script
                     </button>
                   </div>
+                  {asset.status === "failed" && asset.errorMessage ? (
+                    <p className="dock-subtitle mt-2">{asset.errorMessage}</p>
+                  ) : null}
                 </div>
               ))
             )}

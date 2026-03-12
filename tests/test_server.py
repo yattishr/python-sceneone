@@ -200,6 +200,28 @@ def test_gcs_upload_audio_and_get_audio(fake_gcs: FakeGCSStore):
     assert get_response.headers["content-type"].startswith("audio/")
 
 
+def test_gcs_upload_asset_syncs_audio_and_script(fake_gcs: FakeGCSStore):
+    response = client.post(
+        "/gcs/upload-asset",
+        files={"file": ("clip.wav", b"WAVDATA", "audio/wav")},
+        data={"asset_id": "demo_asset_01", "script_text": "ASSET_ID: demo_asset_01\n--- SCRIPT ---\nhello"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["asset_id"] == "demo_asset_01"
+    assert payload["audio_object_name"] == "audio/demo_asset_01.wav"
+    assert payload["script_object_name"] == "scripts/demo_asset_01.txt"
+
+    audio_response = client.get("/gcs/audio/demo_asset_01.wav")
+    assert audio_response.status_code == 200
+    assert audio_response.content == b"WAVDATA"
+
+    script_response = client.get("/gcs/scripts/demo_asset_01")
+    assert script_response.status_code == 200
+    assert "ASSET_ID: demo_asset_01" in script_response.text
+
+
 def test_gcs_get_audio_accepts_prefixed_object_name(fake_gcs: FakeGCSStore):
     fake_gcs.upload_audio_bytes(b"data", "nested/clip.wav")
 

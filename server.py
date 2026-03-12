@@ -356,6 +356,53 @@ async def gcs_upload_audio(
         "object_name": object_path,
     }
 
+@app.post("/gcs/upload-asset")
+async def gcs_upload_asset(
+    asset_id: str = Form(...),
+    script_text: str = Form(...),
+    file: UploadFile = File(...),
+    bucket: str | None = Form(default=None),
+):
+    normalized_asset_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", asset_id.strip()).strip("_")
+    if not normalized_asset_id:
+        raise HTTPException(status_code=400, detail="Invalid asset_id.")
+    if not script_text.strip():
+        raise HTTPException(status_code=400, detail="script_text cannot be empty.")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing audio filename.")
+    if file.content_type and not file.content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be audio.")
+
+    store = _build_gcs_store(bucket_name=bucket)
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded audio is empty.")
+        audio_object_name = store.upload_audio_bytes(
+            data=data,
+            object_name=f"{normalized_asset_id}.wav",
+            content_type=file.content_type or "audio/wav",
+        )
+        script_object_name = store.upload_script_text(
+            script_id=normalized_asset_id,
+            text=script_text,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[gcs-upload-asset] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to upload asset: {exc}") from exc
+    finally:
+        await file.close()
+
+    return {
+        "status": "success",
+        "bucket": store.bucket_name,
+        "asset_id": normalized_asset_id,
+        "audio_object_name": audio_object_name,
+        "script_object_name": script_object_name,
+    }
+
 @app.get("/gcs/scripts/{script_id}", response_class=PlainTextResponse)
 async def gcs_get_script(script_id: str, bucket: str | None = Query(default=None)):
     store = _build_gcs_store(bucket_name=bucket)
