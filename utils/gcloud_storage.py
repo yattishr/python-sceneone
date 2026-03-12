@@ -90,6 +90,17 @@ class GCSAssetStore:
 
         return results
 
+    def delete_audio(self, object_name: str) -> str:
+        normalized = _normalize_audio_object_name(object_name)
+        blob = self.bucket.blob(f"{AUDIO_PREFIX}/{normalized}")
+        blob.delete()
+        return blob.name
+
+    def delete_script(self, script_id: str) -> str:
+        blob = self.bucket.blob(f"{SCRIPTS_PREFIX}/{script_id}.txt")
+        blob.delete()
+        return blob.name
+
 
 def _resolve_prefixes(kind: str, user_prefix: str) -> Iterable[str]:
     clean_prefix = user_prefix.strip("/")

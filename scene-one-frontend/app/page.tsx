@@ -99,6 +99,7 @@ export default function Page() {
   const [captureProgressLabel, setCaptureProgressLabel] = useState("");
   const [captureProgressPercent, setCaptureProgressPercent] = useState(0);
   const [isStopQueued, setIsStopQueued] = useState(false);
+  const [deletingAssetId, setDeletingAssetId] = useState<string | null>(null);
   const [selectedDurationSeconds, setSelectedDurationSeconds] = useState<AllowedDurationSeconds>(DEFAULT_DURATION_SECONDS);
   const [speechStatus, setSpeechStatus] = useState<"idle" | "active" | "unsupported">("idle");
   const [liveStatus, setLiveStatus] = useState<"disconnected" | "connecting" | "connected">("disconnected");
@@ -1259,6 +1260,32 @@ export default function Page() {
     }
   };
 
+  const deleteAsset = async (asset: AssetCard) => {
+    const confirmed = window.confirm(`Delete "${asset.productName}" from Asset Dock and storage?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingAssetId(asset.assetId);
+    try {
+      const response = await fetch(`${BACKEND_BASE_URL}/gcs/assets/${encodeURIComponent(asset.assetId)}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(`Delete failed with status ${response.status}`);
+      }
+      setAssetCards((prev) => prev.filter((item) => item.assetId !== asset.assetId));
+      pushStatusLog(`[SYSTEM]: Deleted asset ${asset.assetId}`);
+      showToast(`Deleted asset: ${asset.productName}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not delete asset";
+      pushStatusLog(`[ERROR]: ${message}`);
+      showToast(message);
+    } finally {
+      setDeletingAssetId(null);
+    }
+  };
+
   const requestStopProduction = async () => {
     setIsStopQueued(true);
     pushStatusLog("[SYSTEM]: Finishing current clip before ending session...");
@@ -1552,15 +1579,15 @@ export default function Page() {
                 <div key={asset.assetId} className="asset-card">
                   <p className="asset-name">{asset.productName}</p>
                   <p className="asset-time">{asset.timestamp} · {asset.durationSeconds}s</p>
-                  <div className="mt-4 flex gap-2">
+                  <div className="asset-actions mt-4">
                     {asset.status === "ready" && asset.wavUrl ? (
-                      <a className="studio-btn studio-btn-primary" href={asset.wavUrl} download>
+                      <a className="studio-btn studio-btn-primary asset-action" href={asset.wavUrl} download>
                         Download .WAV
                       </a>
                     ) : (
                       <button
-                        className="studio-btn studio-btn-secondary"
-                        disabled={asset.status !== "failed"}
+                        className="studio-btn studio-btn-secondary asset-action"
+                        disabled={asset.status !== "failed" || deletingAssetId === asset.assetId}
                         onClick={async () => {
                           if (asset.status === "failed") {
                             await retryAssetSync(asset);
@@ -1571,15 +1598,23 @@ export default function Page() {
                       </button>
                     )}
                     {asset.scriptUrl ? (
-                      <a className="studio-btn studio-btn-secondary" href={asset.scriptUrl} download>
+                      <a className="studio-btn studio-btn-secondary asset-action" href={asset.scriptUrl} download>
                         Download .TXT
                       </a>
                     ) : null}
                     <button
-                      className="studio-btn studio-btn-secondary"
+                      className="studio-btn studio-btn-secondary asset-action"
+                      disabled={deletingAssetId === asset.assetId}
                       onClick={async () => navigator.clipboard.writeText(asset.finalScript)}
                     >
                       Copy Script
+                    </button>
+                    <button
+                      className="studio-btn studio-btn-danger asset-action asset-action-delete"
+                      disabled={deletingAssetId === asset.assetId}
+                      onClick={async () => deleteAsset(asset)}
+                    >
+                      {deletingAssetId === asset.assetId ? "Deleting..." : "Delete"}
                     </button>
                   </div>
                   {asset.status === "failed" && asset.errorMessage ? (

@@ -242,6 +242,19 @@ def _build_gcs_store(bucket_name: str | None = None):
 def _is_gcs_not_found(exc: Exception) -> bool:
     return exc.__class__.__name__ == "NotFound"
 
+def _normalize_asset_id(asset_id: str) -> str:
+    normalized = asset_id.strip().strip("/")
+    if normalized.startswith("scripts/"):
+        normalized = normalized[len("scripts/"):]
+    elif normalized.startswith("audio/"):
+        normalized = normalized[len("audio/"):]
+    if normalized.endswith(".txt"):
+        normalized = normalized[:-4]
+    elif normalized.endswith(".wav"):
+        normalized = normalized[:-4]
+    normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", normalized).strip("_")
+    return normalized
+
 @app.get("/healthz")
 async def healthz():
     return {
@@ -363,7 +376,7 @@ async def gcs_upload_asset(
     file: UploadFile = File(...),
     bucket: str | None = Form(default=None),
 ):
-    normalized_asset_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", asset_id.strip()).strip("_")
+    normalized_asset_id = _normalize_asset_id(asset_id)
     if not normalized_asset_id:
         raise HTTPException(status_code=400, detail="Invalid asset_id.")
     if not script_text.strip():
@@ -401,6 +414,40 @@ async def gcs_upload_asset(
         "asset_id": normalized_asset_id,
         "audio_object_name": audio_object_name,
         "script_object_name": script_object_name,
+    }
+
+@app.delete("/gcs/assets/{asset_id}")
+async def gcs_delete_asset(asset_id: str, bucket: str | None = Query(default=None)):
+    normalized_asset_id = _normalize_asset_id(asset_id)
+    if not normalized_asset_id:
+        raise HTTPException(status_code=400, detail="Invalid asset_id.")
+
+    store = _build_gcs_store(bucket_name=bucket)
+    deleted_audio = False
+    deleted_script = False
+    try:
+        try:
+            store.delete_audio(f"{normalized_asset_id}.wav")
+            deleted_audio = True
+        except Exception as exc:
+            if not _is_gcs_not_found(exc):
+                raise
+        try:
+            store.delete_script(normalized_asset_id)
+            deleted_script = True
+        except Exception as exc:
+            if not _is_gcs_not_found(exc):
+                raise
+    except Exception as exc:
+        logger.exception("[gcs-delete-asset] failed")
+        raise HTTPException(status_code=500, detail=f"Failed to delete asset: {exc}") from exc
+
+    return {
+        "status": "success",
+        "bucket": store.bucket_name,
+        "asset_id": normalized_asset_id,
+        "deleted_audio": deleted_audio,
+        "deleted_script": deleted_script,
     }
 
 @app.get("/gcs/scripts/{script_id}", response_class=PlainTextResponse)

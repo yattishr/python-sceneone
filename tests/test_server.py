@@ -58,6 +58,20 @@ class FakeGCSStore:
             items = [item for item in items if item.startswith(prefix)]
         return items[:max_results]
 
+    def delete_audio(self, object_name: str) -> str:
+        key = f"audio/{object_name.removeprefix('audio/')}"
+        if key not in self.audio:
+            raise KeyError("NotFound")
+        del self.audio[key]
+        return key
+
+    def delete_script(self, script_id: str) -> str:
+        key = f"scripts/{script_id}.txt"
+        if key not in self.scripts:
+            raise KeyError("NotFound")
+        del self.scripts[key]
+        return key
+
 
 @pytest.fixture
 def fake_gcs(monkeypatch: Any):
@@ -220,6 +234,33 @@ def test_gcs_upload_asset_syncs_audio_and_script(fake_gcs: FakeGCSStore):
     script_response = client.get("/gcs/scripts/demo_asset_01")
     assert script_response.status_code == 200
     assert "ASSET_ID: demo_asset_01" in script_response.text
+
+
+def test_gcs_delete_asset_removes_audio_and_script(fake_gcs: FakeGCSStore):
+    fake_gcs.upload_audio_bytes(b"WAVDATA", "delete_me.wav")
+    fake_gcs.upload_script_text("delete_me", "hello")
+
+    response = client.delete("/gcs/assets/delete_me")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["deleted_audio"] is True
+    assert payload["deleted_script"] is True
+
+    assert "audio/delete_me.wav" not in fake_gcs.audio
+    assert "scripts/delete_me.txt" not in fake_gcs.scripts
+
+
+def test_gcs_delete_asset_accepts_prefixed_or_extended_asset_id(fake_gcs: FakeGCSStore):
+    fake_gcs.upload_audio_bytes(b"WAVDATA", "legacy_clip.wav")
+    fake_gcs.upload_script_text("legacy_clip", "hello")
+
+    response = client.delete("/gcs/assets/scripts/legacy_clip.txt")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["asset_id"] == "legacy_clip"
+    assert payload["deleted_audio"] is True
+    assert payload["deleted_script"] is True
 
 
 def test_gcs_get_audio_accepts_prefixed_object_name(fake_gcs: FakeGCSStore):
