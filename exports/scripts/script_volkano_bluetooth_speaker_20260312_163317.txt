@@ -1,0 +1,5 @@
+PRODUCT: Volkano Bluetooth Speaker
+DURATION_SECONDS: 20
+--- SCRIPT ---
+(Scene: Dynamic shots of the Volkano speaker, close-ups on the metallic finish and textured grip.)
+VO: Yo, turn it up. Style meets substance, no compromise. The Volkano Bluetooth Speaker. Sleek design, powerful sound that hits different. Don't just hear the music, feel the vibe. It's portable audio that fits your flow. Lock in.

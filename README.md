@@ -156,6 +156,93 @@ Windows PowerShell:
 python -m pytest -q
 ```
 
+## Reproducible Testing (Hackathon Demo)
+
+Use this checklist to validate the core submission flow end-to-end.
+
+### 1. Start from a clean run
+
+Stop all running backend/frontend processes, then restart both:
+
+```bash
+# Terminal 1 (backend)
+source .venv/bin/activate
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+# Terminal 2 (frontend)
+cd scene-one-frontend
+npm run dev
+```
+
+Windows PowerShell:
+
+```powershell
+# Terminal 1 (backend)
+.\.venv\Scripts\Activate.ps1
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+# Terminal 2 (frontend)
+cd scene-one-frontend
+npm run dev
+```
+
+Expected:
+- Backend starts with no route errors.
+- Frontend loads at `http://localhost:3000`.
+
+### 2. Verify WAV finalization on session end
+
+1. Start a live session in UI.
+2. Trigger a script capture (`capture_ad_script` path).
+3. Click **End Live Session** while capture is active.
+
+Expected:
+- Button shows `Finishing Clip...`.
+- Asset card transitions through status text:
+  - `Generating WAV...`
+  - `Uploading asset...`
+  - `Download .WAV` (ready state)
+- A finalization summary toast/log appears:
+  - `Finalization summary: ready=<n>, failed=<n>, in-progress=<n>`
+
+Backend log should include:
+- `POST /upload-ad`
+- `POST /gcs/upload-asset`
+
+### 3. Verify Asset Dock cleanup (delete)
+
+1. In Asset Dock, click **Delete** on any asset and confirm.
+
+Expected:
+- Asset disappears from dock.
+- Backend log includes:
+  - `DELETE /gcs/assets/{asset_id} 200 OK`
+
+### 4. Verify persistence after refresh
+
+1. Refresh browser.
+2. Click **Sync Assets**.
+
+Expected:
+- Deleted asset does not reappear.
+- Remaining assets still show correct states and download links.
+
+### 5. API spot checks (optional but recommended)
+
+```bash
+# List current objects
+curl 'http://localhost:8000/gcs/list?kind=all&max_results=100'
+
+# Delete by asset id
+curl -X DELETE 'http://localhost:8000/gcs/assets/<asset_id>'
+
+# Delete also accepts prefixed/extended forms
+curl -X DELETE 'http://localhost:8000/gcs/assets/scripts/<asset_id>.txt'
+```
+
+Expected:
+- Delete returns JSON with `status: "success"` and `deleted_audio` / `deleted_script` flags.
+
 ## Google Cloud Storage CLI (Audio + Scripts)
 
 Use the helper CLI to upload and retrieve `audio/` and `scripts/` objects in a GCS bucket.
