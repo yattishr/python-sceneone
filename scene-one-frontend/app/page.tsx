@@ -800,8 +800,9 @@ export default function Page() {
     const run = (async () => {
       const productName = (request.product_name || "untitled").trim() || "untitled";
       const finalScript = (request.final_script || lastDirectorTextRef.current || "No script text.").trim();
-      const durationSeconds = isAllowedDurationSeconds(Number(request.duration_seconds))
-        ? Number(request.duration_seconds)
+      const requestedDurationSeconds = Number(request.duration_seconds);
+      const durationSeconds: AllowedDurationSeconds = isAllowedDurationSeconds(requestedDurationSeconds)
+        ? requestedDurationSeconds
         : selectedDurationSeconds;
       const assetId = (request.asset_id || createAssetId(productName)).trim();
       const recordingDurationMs = durationToMs(durationSeconds);
