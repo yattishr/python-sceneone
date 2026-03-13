@@ -7,7 +7,7 @@ type AssetCard = {
   productName: string;
   finalScript: string;
   timestamp: string;
-  durationSeconds: number;
+  durationSeconds: AllowedDurationSeconds;
   wavUrl: string;
   scriptUrl?: string;
   status: "capturing" | "finalizing_wav" | "syncing_gcs" | "ready" | "failed";
@@ -561,7 +561,7 @@ export default function Page() {
   const buildScriptDocument = (
     assetId: string,
     productName: string,
-    durationSeconds: number,
+    durationSeconds: AllowedDurationSeconds,
     finalScript: string,
   ): string => {
     return `ASSET_ID: ${assetId}\nPRODUCT: ${productName}\nDURATION_SECONDS: ${durationSeconds}\n--- SCRIPT ---\n${finalScript}`.trim();
@@ -643,7 +643,7 @@ export default function Page() {
     if (!Array.isArray(parsed)) {
       return [];
     }
-    return parsed
+    const restoredCards = parsed
       .map((item): AssetCard | null => {
         if (!item || typeof item !== "object") {
           return null;
@@ -678,8 +678,14 @@ export default function Page() {
           errorMessage: typeof item.errorMessage === "string" ? item.errorMessage : undefined,
         };
       })
-      .filter((item): item is AssetCard => Boolean(item))
       .slice(0, 40);
+    const assetCards: AssetCard[] = [];
+    for (const item of restoredCards) {
+      if (item !== null) {
+        assetCards.push(item);
+      }
+    }
+    return assetCards.slice(0, 40);
   };
 
   const loadAssetsFromBackend = async (): Promise<AssetCard[]> => {
