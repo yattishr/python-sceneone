@@ -36,6 +36,18 @@ type GcsListResponse = {
   items?: string[];
 };
 
+type UploadAdResponse = {
+  status: string;
+  duration_ms: number;
+  duration_seconds: number;
+  download_url?: string;
+  storage?: "local" | "gcs";
+  asset_id?: string;
+  audio_object_name?: string | null;
+  script_object_name?: string | null;
+  script_url?: string | null;
+};
+
 
 const BACKEND_BASE_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 const LIVE_APP_NAME = process.env.NEXT_PUBLIC_ADK_LIVE_APP_NAME ?? "scene_one_agent";
@@ -747,7 +759,7 @@ export default function Page() {
         })
     );
 
-    return scriptCards.filter((card): card is AssetCard => Boolean(card));
+    return scriptCards.filter((card): card is AssetCard => card !== null);
   };
 
   const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
@@ -845,9 +857,12 @@ export default function Page() {
         updateCaptureProgress("Generating WAV...", 80);
         const wavBlob = pcm16ToWavBlob(recentPcm, sampleRate);
         const safeName = productName.replace(/\s+/g, "_").toLowerCase();
+        const scriptText = buildScriptDocument(assetId, productName, durationSeconds, finalScript);
         const formData = new FormData();
         formData.append("file", wavBlob, `${safeName}.wav`);
         formData.append("duration_seconds", String(durationSeconds));
+        formData.append("asset_id", assetId);
+        formData.append("script_text", scriptText);
 
         const response = await fetch(`${BACKEND_BASE_URL}/upload-ad`, {
           method: "POST",
@@ -866,32 +881,42 @@ export default function Page() {
           throw new Error(detail);
         }
 
-        const data = await response.json();
+        const data = (await response.json()) as UploadAdResponse;
         if (!data.download_url) {
           throw new Error("Upload succeeded but no download URL returned.");
         }
-        const localWavUrl = absoluteBackendUrl(String(data.download_url));
-        patchAssetCard(assetId, { wavUrl: localWavUrl, status: "syncing_gcs", errorMessage: undefined });
-        updateCaptureProgress("Uploading asset...", 95);
+        const resolvedWavUrl = absoluteBackendUrl(String(data.download_url));
+        if (data.storage === "gcs") {
+          patchAssetCard(assetId, {
+            wavUrl: resolvedWavUrl,
+            scriptUrl: data.script_url ? absoluteBackendUrl(String(data.script_url)) : absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(assetId)}`),
+            status: "ready",
+            errorMessage: undefined,
+          });
+          updateCaptureProgress("Asset ready", 100);
+        } else {
+          patchAssetCard(assetId, { wavUrl: resolvedWavUrl, status: "syncing_gcs", errorMessage: undefined });
+          updateCaptureProgress("Uploading asset...", 95);
 
-        const finalWavResponse = await fetch(localWavUrl);
-        if (!finalWavResponse.ok) {
-          throw new Error(`Failed to fetch finalized WAV: ${finalWavResponse.status}`);
+          const finalWavResponse = await fetch(resolvedWavUrl);
+          if (!finalWavResponse.ok) {
+            throw new Error(`Failed to fetch finalized WAV: ${finalWavResponse.status}`);
+          }
+          const finalWavBlob = await finalWavResponse.blob();
+          await syncAssetWithRetries(assetId, finalWavBlob, productName, durationSeconds, finalScript);
+          patchAssetCard(assetId, {
+            wavUrl: absoluteBackendUrl(`/gcs/audio/${encodePathSegments(`${assetId}.wav`)}`),
+            scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(assetId)}`),
+            status: "ready",
+            errorMessage: undefined,
+          });
+          updateCaptureProgress("Asset ready", 100);
         }
-        const finalWavBlob = await finalWavResponse.blob();
-        await syncAssetWithRetries(assetId, finalWavBlob, productName, durationSeconds, finalScript);
-        patchAssetCard(assetId, {
-          wavUrl: absoluteBackendUrl(`/gcs/audio/${encodePathSegments(`${assetId}.wav`)}`),
-          scriptUrl: absoluteBackendUrl(`/gcs/scripts/${encodeURIComponent(assetId)}`),
-          status: "ready",
-          errorMessage: undefined,
-        });
-        updateCaptureProgress("Asset ready", 100);
         const pending = pendingCaptureRequestRef.current;
         if (!pending || !pending.asset_id || pending.asset_id === assetId) {
           pendingCaptureRequestRef.current = null;
         }
-        pushStatusLog("[SYSTEM]: Asset synced to GCS");
+        pushStatusLog(data.storage === "gcs" ? "[SYSTEM]: Asset finalized directly in GCS" : "[SYSTEM]: Asset synced to GCS");
         pushStatusLog(`[SUCCESS]: ${productName} director audio finalized`);
         showToast(`Sound clip ready: ${productName} (${durationSeconds}s)`);
       } catch (error) {

@@ -1,0 +1,131 @@
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: sceneone
+  _BACKEND_SERVICE: sceneone-backend
+  _FRONTEND_SERVICE: sceneone-frontend
+  _BACKEND_IMAGE: sceneone-backend
+  _FRONTEND_IMAGE: sceneone-frontend
+  _BACKEND_PUBLIC_URL: https://sceneone-backend-439222760580.us-central1.run.app
+  _FRONTEND_PUBLIC_URL: https://sceneone-frontend-REPLACE_ME.a.run.app
+  _GCS_BUCKET: sceneone-media-prod
+  _ADK_LIVE_APP_NAME: scene_one_agent
+  _ADK_LIVE_USER_ID: studio_user_01
+  _ADK_LIVE_MODALITY: AUDIO
+  _BACKEND_MEMORY: 2Gi
+  _BACKEND_CPU: "2"
+  _FRONTEND_MEMORY: 1Gi
+  _FRONTEND_CPU: "1"
+  _BACKEND_TIMEOUT: "900"
+  _FRONTEND_TIMEOUT: "300"
+  _BACKEND_MIN_INSTANCES: "0"
+  _FRONTEND_MIN_INSTANCES: "0"
+  _BACKEND_MAX_INSTANCES: "10"
+  _FRONTEND_MAX_INSTANCES: "10"
+  _GEMINI_SECRET_NAME: sceneone-google-api-key
+
+steps:
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_BACKEND_IMAGE}:${BUILD_ID}
+      - .
+
+  - id: push-backend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_BACKEND_IMAGE}:${BUILD_ID}
+
+  - id: deploy-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_BACKEND_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_BACKEND_IMAGE}:${BUILD_ID}
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --service-account
+      - sceneone-backend@${PROJECT_ID}.iam.gserviceaccount.com
+      - --memory
+      - ${_BACKEND_MEMORY}
+      - --cpu
+      - ${_BACKEND_CPU}
+      - --timeout
+      - ${_BACKEND_TIMEOUT}
+      - --min-instances
+      - ${_BACKEND_MIN_INSTANCES}
+      - --max-instances
+      - ${_BACKEND_MAX_INSTANCES}
+      - --set-env-vars
+      - GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${_REGION},GCS_BUCKET=${_GCS_BUCKET},ADK_LIVE_APP_NAME=${_ADK_LIVE_APP_NAME},ALLOWED_ORIGINS=${_FRONTEND_PUBLIC_URL},SYNC_UPLOADS_TO_GCS=true,PERSIST_LOCAL_EXPORTS=false
+      - --update-secrets
+      - GOOGLE_API_KEY=${_GEMINI_SECRET_NAME}:latest
+
+  - id: build-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - scene-one-frontend/Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_FRONTEND_IMAGE}:${BUILD_ID}
+      - --build-arg
+      - NEXT_PUBLIC_BACKEND_URL=${_BACKEND_PUBLIC_URL}
+      - --build-arg
+      - NEXT_PUBLIC_ADK_LIVE_APP_NAME=${_ADK_LIVE_APP_NAME}
+      - --build-arg
+      - NEXT_PUBLIC_ADK_LIVE_USER_ID=${_ADK_LIVE_USER_ID}
+      - --build-arg
+      - NEXT_PUBLIC_ADK_LIVE_MODALITY=${_ADK_LIVE_MODALITY}
+      - --build-arg
+      - COPILOTKIT_AGENT_URL=${_BACKEND_PUBLIC_URL}/copilotkit
+      - ./scene-one-frontend
+
+  - id: push-frontend
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_FRONTEND_IMAGE}:${BUILD_ID}
+
+  - id: deploy-frontend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_FRONTEND_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_FRONTEND_IMAGE}:${BUILD_ID}
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --service-account
+      - sceneone-frontend@${PROJECT_ID}.iam.gserviceaccount.com
+      - --memory
+      - ${_FRONTEND_MEMORY}
+      - --cpu
+      - ${_FRONTEND_CPU}
+      - --timeout
+      - ${_FRONTEND_TIMEOUT}
+      - --min-instances
+      - ${_FRONTEND_MIN_INSTANCES}
+      - --max-instances
+      - ${_FRONTEND_MAX_INSTANCES}
+      - --set-env-vars
+      - NEXT_PUBLIC_BACKEND_URL=${_BACKEND_PUBLIC_URL},NEXT_PUBLIC_ADK_LIVE_APP_NAME=${_ADK_LIVE_APP_NAME},NEXT_PUBLIC_ADK_LIVE_USER_ID=${_ADK_LIVE_USER_ID},NEXT_PUBLIC_ADK_LIVE_MODALITY=${_ADK_LIVE_MODALITY},COPILOTKIT_AGENT_URL=${_BACKEND_PUBLIC_URL}/copilotkit
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_BACKEND_IMAGE}:${BUILD_ID}
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/${_FRONTEND_IMAGE}:${BUILD_ID}

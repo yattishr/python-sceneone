@@ -162,6 +162,33 @@ def test_upload_ad_endpoint_returns_exact_requested_wav_duration():
     if os.path.exists(exported_file_path):
         os.remove(exported_file_path)
 
+
+def test_upload_ad_endpoint_can_sync_directly_to_gcs(fake_gcs: FakeGCSStore, monkeypatch: Any):
+    monkeypatch.setenv("SYNC_UPLOADS_TO_GCS", "true")
+    monkeypatch.setenv("PERSIST_LOCAL_EXPORTS", "false")
+
+    assert os.path.exists(SHORT_AUDIO_PATH)
+    with open(SHORT_AUDIO_PATH, "rb") as f:
+        response = client.post(
+            "/upload-ad",
+            files={"file": ("dummy_short_audio.wav", f, "audio/wav")},
+            data={
+                "duration_seconds": "10",
+                "asset_id": "demo_asset_01",
+                "script_text": "ASSET_ID: demo_asset_01\n--- SCRIPT ---\nhello",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["storage"] == "gcs"
+    assert payload["audio_object_name"] == "audio/demo_asset_01.wav"
+    assert payload["script_object_name"] == "scripts/demo_asset_01.txt"
+    assert payload["download_url"].endswith("/gcs/audio/demo_asset_01.wav")
+    assert payload["script_url"].endswith("/gcs/scripts/demo_asset_01")
+    assert fake_gcs.audio["audio/demo_asset_01.wav"]
+    assert "ASSET_ID: demo_asset_01" in fake_gcs.scripts["scripts/demo_asset_01.txt"]
+
 def test_upload_ad_endpoint_rejects_invalid_duration():
     """
     Upload endpoint should reject durations outside the allowed set.

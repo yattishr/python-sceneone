@@ -38,6 +38,23 @@ from google.genai.errors import APIError
 load_dotenv()
 logger = logging.getLogger("sceneone.server")
 
+
+def _parse_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 def _resolve_response_modality(modality: str):
     """
     Prefer enum modality objects when available to avoid pydantic serializer warnings.
@@ -90,10 +107,7 @@ live_runner = Runner(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_parse_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -620,6 +634,10 @@ async def upload_ad(
     request: Request,
     file: UploadFile = File(...),
     duration_seconds: int = Form(default=DEFAULT_TARGET_DURATION_SECONDS),
+    asset_id: str | None = Form(default=None),
+    script_text: str | None = Form(default=None),
+    sync_to_gcs: bool | None = Form(default=None),
+    bucket: str | None = Form(default=None),
 ):
     print(
         f"[upload-ad] received file='{file.filename}' "
@@ -633,10 +651,20 @@ async def upload_ad(
     duration_seconds = _validate_duration_seconds(duration_seconds)
     target_duration_ms = duration_seconds * 1000
     safe_name = _safe_stem(file.filename)
+    normalized_asset_id = _normalize_asset_id(asset_id or safe_name)
+    should_sync_to_gcs = _env_flag("SYNC_UPLOADS_TO_GCS", default=False) if sync_to_gcs is None else sync_to_gcs
+    keep_local_exports = _env_flag("PERSIST_LOCAL_EXPORTS", default=True)
+    if should_sync_to_gcs and not normalized_asset_id:
+        raise HTTPException(status_code=400, detail="asset_id is required when sync_to_gcs is enabled.")
+    if script_text is not None and not normalized_asset_id:
+        raise HTTPException(status_code=400, detail="asset_id is required when script_text is provided.")
+
     temp_suffix = Path(file.filename).suffix or ".bin"
     temp_path = Path(f"temp_{uuid.uuid4().hex}{temp_suffix}")
     final_filename = f"sceneone_{safe_name}_{uuid.uuid4().hex[:8]}.wav"
     final_path = Path(EXPORT_DIR) / final_filename
+    gcs_audio_object_name: str | None = None
+    gcs_script_object_name: str | None = None
     is_probably_wav = temp_suffix.lower() == ".wav" or (file.content_type or "").lower() in {
         "audio/wav",
         "audio/x-wav",
@@ -662,6 +690,20 @@ async def upload_ad(
 
         processed_audio = trim_and_clean_audio(str(temp_path), target_duration_ms=target_duration_ms)
         processed_audio.export(str(final_path), format="wav")
+        if should_sync_to_gcs:
+            store = _build_gcs_store(bucket_name=bucket)
+            gcs_audio_object_name = store.upload_audio_bytes(
+                data=final_path.read_bytes(),
+                object_name=f"{normalized_asset_id}.wav",
+                content_type="audio/wav",
+            )
+            if script_text is not None:
+                gcs_script_object_name = store.upload_script_text(
+                    script_id=normalized_asset_id,
+                    text=script_text,
+                )
+            if not keep_local_exports and final_path.exists():
+                final_path.unlink()
     except CouldntDecodeError as exc:
         logger.exception("[upload-ad] could not decode audio file")
         raise HTTPException(
@@ -683,7 +725,20 @@ async def upload_ad(
         "status": "success",
         "duration_ms": len(processed_audio),
         "duration_seconds": duration_seconds,
-        "download_url": f"{str(request.base_url).rstrip('/')}/download/{final_filename}",
+        "storage": "gcs" if gcs_audio_object_name else "local",
+        "asset_id": normalized_asset_id,
+        "audio_object_name": gcs_audio_object_name,
+        "script_object_name": gcs_script_object_name,
+        "download_url": (
+            f"{str(request.base_url).rstrip('/')}/gcs/audio/{gcs_audio_object_name.removeprefix('audio/')}"
+            if gcs_audio_object_name
+            else f"{str(request.base_url).rstrip('/')}/download/{final_filename}"
+        ),
+        "script_url": (
+            f"{str(request.base_url).rstrip('/')}/gcs/scripts/{normalized_asset_id}"
+            if gcs_script_object_name
+            else None
+        ),
     }
 
 if __name__ == "__main__":
