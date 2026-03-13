@@ -1,0 +1,23 @@
+.git
+.gitignore
+.gcloudignore
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+service-account.json
+.archive/
+.benchmarks/
+.adk/
+exports/audio/*
+exports/scripts/*
+tests/
+New Text Document.txt
+
+scene-one-frontend/.next/
+scene-one-frontend/node_modules/
+scene-one-frontend/.env*
+scene-one-frontend/app/notes/
