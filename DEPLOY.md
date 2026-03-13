@@ -43,7 +43,7 @@ If you already have custom domains, use those instead.
 Example:
 
 ```bash
-gcloud builds submit --config cloudbuild.yaml --substitutions=_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-439222760580.us-central1.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-REPLACE_ME.a.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key
+gcloud builds submit --config cloudbuild.yaml --substitutions=_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-439222760580.us-central1.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-439222760580.us-central1.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key
 ```
 
 ## 4. Runtime behavior in production

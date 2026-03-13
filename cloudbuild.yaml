@@ -6,7 +6,7 @@ substitutions:
   _BACKEND_IMAGE: sceneone-backend
   _FRONTEND_IMAGE: sceneone-frontend
   _BACKEND_PUBLIC_URL: https://sceneone-backend-439222760580.us-central1.run.app
-  _FRONTEND_PUBLIC_URL: https://sceneone-frontend-REPLACE_ME.a.run.app
+  _FRONTEND_PUBLIC_URL: https://sceneone-frontend-439222760580.us-central1.run.app
   _GCS_BUCKET: sceneone-media-prod
   _ADK_LIVE_APP_NAME: scene_one_agent
   _ADK_LIVE_USER_ID: studio_user_01
