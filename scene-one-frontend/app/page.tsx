@@ -715,7 +715,7 @@ export default function Page() {
       }
     }
 
-    const scriptCards = await Promise.all(
+    const scriptCardResults = await Promise.all(
       scriptItems
         .filter((item): item is string => typeof item === "string" && item.endsWith(".txt"))
         .slice(0, 40)
@@ -759,7 +759,13 @@ export default function Page() {
         })
     );
 
-    return scriptCards.filter((card): card is AssetCard => card !== null);
+    const scriptCards: AssetCard[] = [];
+    for (const card of scriptCardResults) {
+      if (card !== null) {
+        scriptCards.push(card);
+      }
+    }
+    return scriptCards;
   };
 
   const extractCaptureRequestFromPayload = (payload: any): CaptureRequest | null => {
