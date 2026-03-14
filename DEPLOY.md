@@ -38,31 +38,41 @@ Recommended approach:
 
 If you already have custom domains, use those instead.
 
+Current Cloud Run URLs for this project:
+
+- backend: `https://sceneone-backend-x4wprlh2nq-uc.a.run.app`
+- frontend: `https://sceneone-frontend-x4wprlh2nq-uc.a.run.app`
+
 ## 3. Deploy with Cloud Build
 
 Example:
 
 ```bash
-gcloud builds submit --config cloudbuild.yaml --substitutions=_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-439222760580.us-central1.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-439222760580.us-central1.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key
+gcloud builds submit --config cloudbuild.yaml --substitutions=_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-x4wprlh2nq-uc.a.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-x4wprlh2nq-uc.a.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key
 ```
 
 Windows Example:
 ```bash
-gcloud builds submit --config cloudbuild.yaml --substitutions="_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-439222760580.us-central1.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-439222760580.us-central1.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key"
+gcloud builds submit --config cloudbuild.yaml --substitutions="_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-x4wprlh2nq-uc.a.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-x4wprlh2nq-uc.a.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key"
 ```
 
 ## 4. Runtime behavior in production
 
 The backend deployment in [cloudbuild.yaml](/mnt/c/Projects/python-sceneone/cloudbuild.yaml) sets:
 
+- `GOOGLE_GENAI_USE_VERTEXAI=false`
+- `GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-12-2025`
 - `SYNC_UPLOADS_TO_GCS=true`
 - `PERSIST_LOCAL_EXPORTS=false`
 
 That means:
 
+- the backend uses the Google AI API key path rather than Vertex by default
+- live sessions target a native-audio Gemini model suitable for `/run_live`
 - `/upload-ad` finalizes WAVs and uploads them straight to GCS
 - returned `download_url` values point at `/gcs/audio/...`
 - Cloud Run instances do not keep local exported audio as the source of truth
+- the backend deploy step also reapplies public invoker access so browser traffic can reach `/gcs/*` and `/run_live`
 
 Local development still works without this path because the backend defaults to local exports unless you enable direct GCS sync.
 
@@ -82,3 +92,4 @@ After first deploy, verify:
 2. WebSocket `/run_live` connects through Cloud Run
 3. a generated asset lands in `gs://sceneone-media-prod/audio/` and `gs://sceneone-media-prod/scripts/`
 4. asset playback in the dock uses the `/gcs/audio/...` URL returned by the backend
+5. `https://sceneone-backend-x4wprlh2nq-uc.a.run.app/openapi.json` returns the FastAPI OpenAPI document

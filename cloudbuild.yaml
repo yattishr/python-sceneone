@@ -5,8 +5,8 @@ substitutions:
   _FRONTEND_SERVICE: sceneone-frontend
   _BACKEND_IMAGE: sceneone-backend
   _FRONTEND_IMAGE: sceneone-frontend
-  _BACKEND_PUBLIC_URL: https://sceneone-backend-439222760580.us-central1.run.app
-  _FRONTEND_PUBLIC_URL: https://sceneone-frontend-439222760580.us-central1.run.app
+  _BACKEND_PUBLIC_URL: https://sceneone-backend-x4wprlh2nq-uc.a.run.app
+  _FRONTEND_PUBLIC_URL: https://sceneone-frontend-x4wprlh2nq-uc.a.run.app
   _GCS_BUCKET: sceneone-media-prod
   _ADK_LIVE_APP_NAME: scene_one_agent
   _ADK_LIVE_USER_ID: studio_user_01
@@ -71,6 +71,21 @@ steps:
       - GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=${_REGION},GOOGLE_GENAI_USE_VERTEXAI=false,GEMINI_MODEL=${_GEMINI_MODEL},GCS_BUCKET=${_GCS_BUCKET},ADK_LIVE_APP_NAME=${_ADK_LIVE_APP_NAME},ALLOWED_ORIGINS=${_FRONTEND_PUBLIC_URL},FRONTEND_PUBLIC_URL=${_FRONTEND_PUBLIC_URL},SYNC_UPLOADS_TO_GCS=true,PERSIST_LOCAL_EXPORTS=false
       - --update-secrets
       - GOOGLE_API_KEY=${_GEMINI_SECRET_NAME}:latest
+
+  - id: allow-public-backend
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - add-iam-policy-binding
+      - ${_BACKEND_SERVICE}
+      - --region
+      - ${_REGION}
+      - --member
+      - allUsers
+      - --role
+      - roles/run.invoker
 
   - id: build-frontend
     name: gcr.io/cloud-builders/docker

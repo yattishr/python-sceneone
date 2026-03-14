@@ -12,9 +12,12 @@ This project deploys as two Cloud Run services:
 | `GOOGLE_API_KEY` | Yes, unless you switch code to Vertex-only auth | `projects/.../secrets/sceneone-google-api-key` | Gemini auth. In Cloud Run this should come from Secret Manager. |
 | `GOOGLE_CLOUD_PROJECT` | Yes | `my-gcp-project` | Used by current backend auth validation and GCP SDK clients. |
 | `GOOGLE_CLOUD_LOCATION` | Yes | `us-central1` | Gemini/Vertex region and general runtime region. |
+| `GOOGLE_GENAI_USE_VERTEXAI` | Recommended | `false` | Set to `false` when production uses a Google AI API key instead of Vertex auth. |
+| `GEMINI_MODEL` | Recommended for live mode | `gemini-2.5-flash-native-audio-preview-12-2025` | Live-capable Gemini model used by the SceneOne director agent. |
 | `GCS_BUCKET` | Yes | `sceneone-media-prod` | Bucket used by `/gcs/*` routes and helper CLI. |
 | `ADK_LIVE_APP_NAME` | Recommended | `scene_one_agent` | Live session app name passed into ADK runner. |
 | `ALLOWED_ORIGINS` | Yes in production | `https://studio.example.com` | Comma-separated browser origins allowed by CORS. |
+| `FRONTEND_PUBLIC_URL` | Recommended in production | `https://sceneone-frontend-x4wprlh2nq-uc.a.run.app` | Secondary source of truth for backend CORS origin parsing. |
 | `SYNC_UPLOADS_TO_GCS` | Recommended in production | `true` | Makes `/upload-ad` publish finalized WAVs directly to GCS and return GCS-backed URLs. |
 | `PERSIST_LOCAL_EXPORTS` | Recommended in production | `false` | Keeps Cloud Run instances from accumulating ephemeral local export files after GCS sync. |
 | `PORT` | Cloud Run injects it | `8080` | Container listen port. |
@@ -48,6 +51,10 @@ Backend service account should have:
 - `Storage Object Admin` or narrower bucket-scoped object permissions on the target bucket
 - `Secret Manager Secret Accessor` on the Gemini API key secret
 - any additional Vertex AI permissions if you later switch from API key auth to Vertex auth
+
+Cloud Run service access should also allow browser traffic:
+
+- backend service should have `roles/run.invoker` for `allUsers` if the frontend calls it directly from the browser
 
 Frontend service account can usually be minimal unless you add server-side integrations later.
 

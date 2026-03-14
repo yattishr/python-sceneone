@@ -5,6 +5,49 @@ SceneOne is a live ad-production app with:
 - a Next.js studio UI
 - a FastAPI backend that accepts mic recordings, cleans audio, and exports a final WAV
 
+## Production Endpoints
+
+Current Cloud Run endpoints:
+
+- Frontend: `https://sceneone-frontend-x4wprlh2nq-uc.a.run.app`
+- Backend: `https://sceneone-backend-x4wprlh2nq-uc.a.run.app`
+
+Useful backend URLs in production:
+
+- OpenAPI: `https://sceneone-backend-x4wprlh2nq-uc.a.run.app/openapi.json`
+- Swagger UI: `https://sceneone-backend-x4wprlh2nq-uc.a.run.app/docs`
+
+Notes:
+
+- The frontend must be built with the same backend URL that Cloud Run is currently serving.
+- The backend Cloud Run service must remain publicly invokable for browser access to `/gcs/*` and `/run_live`.
+- `healthz` is defined by the app, but `/openapi.json` and `/docs` are the most reliable production verification endpoints.
+
+## Automated Deployment
+
+Cloud deployment is automated with Google Cloud Build and supporting setup scripts.
+
+Primary automation files:
+
+- [cloudbuild.yaml](/C:/Projects/python-sceneone/cloudbuild.yaml)
+- [scripts/bootstrap-gcp.sh](/C:/Projects/python-sceneone/scripts/bootstrap-gcp.sh)
+- [DEPLOY.md](/C:/Projects/python-sceneone/DEPLOY.md)
+
+What the pipeline automates:
+
+- builds backend and frontend container images
+- pushes both images to Artifact Registry
+- deploys both services to Cloud Run
+- injects runtime environment variables and secrets
+- configures the backend for browser access, GCS sync, and live audio
+- reapplies public backend invoker access for `/gcs/*` and `/run_live`
+
+Example deploy command:
+
+```bash
+gcloud builds submit --config cloudbuild.yaml --substitutions="_REGION=us-central1,_AR_REPO=sceneone,_BACKEND_PUBLIC_URL=https://sceneone-backend-x4wprlh2nq-uc.a.run.app,_FRONTEND_PUBLIC_URL=https://sceneone-frontend-x4wprlh2nq-uc.a.run.app,_GCS_BUCKET=sceneone-media-prod,_GEMINI_SECRET_NAME=sceneone-google-api-key"
+```
+
 ## Recording Loop
 
 When the agent calls `capture_ad_script`:
@@ -119,6 +162,17 @@ Live lane request flow:
 3. Native-audio model streams events over the same websocket.
 
 Open `http://localhost:3000`.
+
+## Production Deploy Notes
+
+- `cloudbuild.yaml` currently targets:
+  - backend: `https://sceneone-backend-x4wprlh2nq-uc.a.run.app`
+  - frontend: `https://sceneone-frontend-x4wprlh2nq-uc.a.run.app`
+- The backend deploy step sets:
+  - `GOOGLE_GENAI_USE_VERTEXAI=false`
+  - `GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-12-2025`
+  - `ALLOWED_ORIGINS` and `FRONTEND_PUBLIC_URL` to the frontend public URL
+- The deploy pipeline also reapplies `roles/run.invoker` for `allUsers` on the backend service so browser fetches and WebSocket connections continue to work after redeploys.
 
 ## FFmpeg Install
 
