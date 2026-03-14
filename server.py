@@ -39,14 +39,36 @@ load_dotenv()
 logger = logging.getLogger("sceneone.server")
 
 
+def _normalize_origin(origin: str) -> str:
+    cleaned = origin.strip().strip("'\"").rstrip("/")
+    return cleaned
+
+
 def _parse_allowed_origins() -> list[str]:
     raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    origins: list[str] = []
+
     if raw:
-        return [origin.strip() for origin in raw.split(",") if origin.strip()]
-    return [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+        origins.extend(
+            normalized
+            for origin in raw.split(",")
+            if (normalized := _normalize_origin(origin))
+        )
+
+    frontend_public_url = _normalize_origin(os.getenv("FRONTEND_PUBLIC_URL", ""))
+    if frontend_public_url:
+        origins.append(frontend_public_url)
+
+    if not origins:
+        origins.extend(
+            [
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+            ]
+        )
+
+    # Preserve order for logging/debugging while removing duplicates.
+    return list(dict.fromkeys(origins))
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
