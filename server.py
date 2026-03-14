@@ -296,6 +296,8 @@ async def healthz():
     return {
         "status": "ok",
         "live_app_name": LIVE_APP_NAME,
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"),
+        "google_genai_use_vertexai": os.getenv("GOOGLE_GENAI_USE_VERTEXAI"),
         "copilotkit_path": ADK_ENDPOINT_PATH,
         "live_ws_path": "/run_live",
         "upload_path": "/upload-ad",
